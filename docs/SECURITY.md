@@ -7,8 +7,8 @@ an end-to-end fork run, and the test suites in this repository. Nothing has been
 
 | Contract | SHA-256 of the tested source |
 |---|---|
-| `contracts/PulpVeVault.sol` | `c3bf146418b23d7a915848b4294218f20d5dcd1a2c7bca927f3ba2e2eaad7062` (externally audited version: `a8bb34b40faec1de7913a38222b645bf4914fae63afc18b54743265ca7c9f0d4`; reviewed by review 3: `647e8ae8…`; by R4/R5: `95356b25…`) |
-| `contracts/PulpZap.sol` | `871cbf4865ca76c1bd567124fd414deaa87a46c1798c11262002f4cf5897c042` |
+| `contracts/PulpVeVault.sol` | `7254a21c7182dbb1c8d3b189bf230a0a7dcf16ed8ead60c34a8e1cd80a04bc48` (comments trimmed; same compiled code as the tested `c3bf1464…`) (externally audited version: `a8bb34b40faec1de7913a38222b645bf4914fae63afc18b54743265ca7c9f0d4`; reviewed by review 3: `647e8ae8…`; by R4/R5: `95356b25…`) |
+| `contracts/PulpZap.sol` | `7f35b93932283fb0ae991b214e446ee210f14478ebfa43847d1e7d3c5cb3bac0` (comments trimmed; same compiled code as the tested and reviewed `871cbf48…`) |
 
 ## Timeline
 

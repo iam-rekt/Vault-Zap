@@ -358,8 +358,8 @@ token paired with native ETH on a Uniswap v4 chain. What to change:
 
 | Path | What |
 |---|---|
-| `contracts/PulpVeVault.sol` | The vault (sha256 `c3bf146418b23d7a915848b4294218f20d5dcd1a2c7bca927f3ba2e2eaad7062`) |
-| `contracts/PulpZap.sol` | The zap (sha256 `871cbf4865ca76c1bd567124fd414deaa87a46c1798c11262002f4cf5897c042`) |
+| `contracts/PulpVeVault.sol` | The vault (sha256 `7254a21c7182dbb1c8d3b189bf230a0a7dcf16ed8ead60c34a8e1cd80a04bc48`) |
+| `contracts/PulpZap.sol` | The zap (sha256 `7f35b93932283fb0ae991b214e446ee210f14478ebfa43847d1e7d3c5cb3bac0`) |
 | `contracts/interfaces/` | `IPulpVeVault` (the vault functions the zap uses, plus WETH9) and minimal Uniswap v4 types (`IUniswapV4`) |
 | `contracts/test/` | Test-only mocks: tokens (plain, fee-on-transfer, false-return, blocking, pausable, re-entrant, two-address, breakable), `MockWETH`, `MockWETH9`, a mock v4 PoolManager, bridge executor, hostile receivers. Never deployed by the scripts |
 | `scripts/deploy-vault.js`, `scripts/deploy-zap.js` | Deploy scripts (hidden-prompt keys, dry run, checks, read-back, verification) |
