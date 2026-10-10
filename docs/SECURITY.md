@@ -37,7 +37,7 @@ typo guards.
 | R4-3, R5-1 | Treasury handover liveness: anyone can keep `acceptTreasury` blocked (recycling empty days, dust funding, permissionless releases restarting the clock) | **Resolved by removing the acceptance scan and the release clock** (`UnearnedRewardsScheduled`, `lastReleasedAt`). `acceptTreasury`: only the pending treasury, only from `treasuryProposedAt + 8 days`, and `_checkTreasury`. A pending proposal is still cleared on every ownership change |
 | R4-4 | `lastReleasedAt` can be bumped by anyone through a release | **Moot:** `lastReleasedAt` is removed |
 | R5-3 | The registry (5 active + 10 retired) can fill up; then nothing can be retired or reactivated | **Accepted, documented.** If it is ever full, a broken active token stays in `claimAll`, but per-token `claim`/`claimTo` always works for every other token (tested) |
-| R4-5 | Info notes (documentation, events, gas) | **Documented** in [TECHNICAL.md](TECHNICAL.md) |
+| R4-5 | Info notes: a `_removeFrom` comment cites only the retired cap (it also serves the active list); `acceptTreasury` is not `nonReentrant` (it makes no external calls); a new treasury can still receive dust and budgets of days with no power; offering ownership (`transferOwnership`) does not clear a pending treasury proposal, only accepting it does; the claim-deadline notes are moot after its removal | **Documented / no change needed** |
 
 **Accepted residual (A1-2, with review 3 H-1/M-1).** A compromised owner Safe can, after the 8-day public notice,
 accept a new treasury and route funded-but-unearned reward budgets to it (exit, release, sweep). Never principal,
