@@ -206,7 +206,7 @@ AC-5; any of them would strand the fee or the sweep). `sweep` has no destination
 can only go to the treasury, and moving the treasury emits `FeeRecipientSet`, which monitoring should alert on.
 Sweep only ever sees strays: the zap holds no user funds between transactions, and `sweep` is `nonReentrant`,
 so it cannot run inside a zap. The owner cannot pause zaps, move user funds, change the pool, vault, slippage
-checks or the cap, or upgrade anything. Use a multisig: a compromised owner can take 2% of every zap (within
+checks or the cap, or upgrade anything. Use a Safe multisig: a compromised owner can take 2% of every zap (within
 each caller's `maxFeeBps`) until it is rotated.
 
 ### Deploying

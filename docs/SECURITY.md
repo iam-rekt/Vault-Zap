@@ -2,12 +2,12 @@
 
 **The vault's previous source (`a8bb34b4…`, below) had two external audits (A1, A2); the fixes made for their
 findings are in the current source and have not been externally reviewed yet. The zap has had no external
-audit.** Everything else below is internal: two AI-assisted security reviews, one AI-assisted checklist audit with
+audit.** Everything else below is internal: three AI-assisted security reviews, one AI-assisted checklist audit with
 an end-to-end fork run, and the test suites in this repository. Nothing has been deployed.
 
 | Contract | SHA-256 of the tested source |
 |---|---|
-| `contracts/PulpVeVault.sol` | `647e8ae861b1cc0b50df41891bcd2dc5b5752556842a3ce71abc626b8e8ba4d2` (externally audited version: `a8bb34b40faec1de7913a38222b645bf4914fae63afc18b54743265ca7c9f0d4`) |
+| `contracts/PulpVeVault.sol` | `95356b2548f883b8eb906286b65992932004dbb84ef83840c366ef06656ab6bc` (externally audited version: `a8bb34b40faec1de7913a38222b645bf4914fae63afc18b54743265ca7c9f0d4`; reviewed by review 3: `647e8ae8…`) |
 | `contracts/PulpZap.sol` | `871cbf4865ca76c1bd567124fd414deaa87a46c1798c11262002f4cf5897c042` |
 
 ## Timeline
@@ -19,6 +19,7 @@ an end-to-end fork run, and the test suites in this repository. Nothing has been
 | 2026-10-10 | Checklist audit + end-to-end fork run (below) | 0 Critical, 0 High, 3 Medium, 11 Low, ~25 Info after de-duplication. All Mediums and Lows fixed or documented |
 | 2026-10-10 | Re-review of the audit fixes | No Critical/High/Medium; 3 Lows (L-1 to L-3), all fixed |
 | 2026-10 | Two external audits of the vault (A1, A2), source `a8bb34b4…` | A1-1 and A1-2 (registry deadlock, treasury handover), A2-3/A2-4/A2-6 fixed; the rest documented or accepted (below) |
+| 2026-10-10 | Adversarial review of the A1/A2 fixes (review 3), source `647e8ae8…` | 1 High, 1 Medium (both need a compromised owner Safe and reach only unearned protocol budgets: accepted), 1 Low fixed, 4 Info (below) |
 
 ## External audits A1 and A2 (vault)
 
@@ -40,6 +41,23 @@ The audit reports are not part of this repository.
 | A2-8 | A hostile pool hook could open a lock for the beneficiary in the middle of a zap | **Not reachable** with the real tax hook: its code is fixed and its only external call forwards 50k gas, far below a lock (~1.7M) |
 | A2-9 | An OrRefund failure that used over 7/8 of the hop's gas is reported as `InsufficientGas` instead of refunded | **Accepted:** practically unreachable (the auditor agrees); real failures happen early in the hop |
 | A2-10 | If a reward token's balance falls below what is owed, the last claimers bear the shortfall | **Accepted, documented** token trust assumption (reward tokens must be plain ERC-20s) |
+
+## Review 3 (adversarial review of the A1/A2 fixes)
+
+IDs are local to this review. The vault's owner is a Safe multisig, so H-1 and M-1 require that Safe to be
+compromised; they only ever reach the protocol's own **unearned** reward budgets, never a locker's principal or
+earned rewards. They are accepted as owner-trust residuals; no new mechanism was added. Regression tests replaying
+the reviewer's proofs of concept: `test/vault/review3.test.js`.
+
+| ID | Severity | Finding | Resolution |
+|---|---|---|---|
+| H-1 | High | The treasury-change protections (acceptance blocked while unearned budgets are scheduled, and until 8 days after the last release) can be bypassed by a compromised owner: it registers a hostile "reward token" whose `balanceOf` makes `_checkReserves` revert after any sweep, so the current treasury can't sweep released budgets for the 8 days; then its own proposed treasury accepts and sweeps them | **Accepted (owner trust).** Needs the owner Safe to be compromised; reaches only budgets nobody has earned yet (the test checks lockers claim everything earned and withdraw all principal). Monitoring: alert on `RewardTokenAdded`, `TreasuryProposed` and `EmergencyExitEnabled`. Documented in [TECHNICAL.md](TECHNICAL.md) (Treasury) |
+| M-1 | Medium | Pausing locks through the funded launch week makes every funded day zero-power; acceptance is then possible from launch + 7 days and those budgets reach the new treasury after an exit | **Accepted (owner trust).** Needs the owner Safe; nobody could lock, so no user funds are involved. Anyone can recycle each zero-power day as it closes (`recycleEmptyRewards`, permissionless), which keeps acceptance blocked (tested). Alert on `LocksPausedSet` |
+| L-1 | Low | Return bomb: `_tryBalance` used a high-level `staticcall` that copied all returndata into memory, so 15 hostile reward tokens made a recovery cost up to ~69M gas | **Fixed.** Assembly `staticcall` with the 100k gas cap and a fixed 32-byte output buffer; a read counts only if the call succeeds and returns at least 32 bytes. With 15 return-bomb tokens (5 active + 10 retired): `recoverExcess` 3.10M gas, `recoverERC20` 3.12M (gas-burning tokens 3.26M / 3.28M; normal 0.40M / 0.42M) |
+| I-1 | Info | Treasury validation | **Fixed:** `_checkTreasury` (constructor, `proposeTreasury`, `acceptTreasury`) also refuses WETH by address (so also after WETH is removed) and expired reward tokens |
+| I-2 | Info | The reward-token registry can be kept full | **Documented:** a full registry can block removals for up to 120 days (until retired tokens can be expired); per-token `claim`/`claimTo` always works meanwhile |
+| I-3 | Info | (see the review) | Moot for the current design; no change |
+| I-4 | Info | Owner griefing through hostile reward tokens (for example delaying recoveries with a vetoing `balanceOf`) | **Documented** owner-trust assumption: the owner can delay, never take, and principal and earned rewards stay reachable |
 
 ## Review 1 and 2 (internal reviews)
 
@@ -168,6 +186,7 @@ whether L1 force inclusion bypasses Robinhood's filter; Timeboost.
 | M-C sandwiches | Mitigated: optional `minSqrtPriceX96`; frontend slippage 0.5% floor / 3% max, price-impact warning from 2%, refusal above 5% |
 | Lows | All fixed or documented: DOS-1, EF-1, EF-4, AC-2/DOS-2, AC-3 + E2E-4, AC-5/AC-6, CB-2/CB-3/AMM-2/AMM-3/GA-1 (docs, trust table, frontend limits), GA-4/AC-7, MS-3, DOS-3/EF-5, GA-3 |
 | External audits A1, A2 | A1-1, A1-2, A2-3, A2-4, A2-6 fixed (A2-1 with A1-2); A2-8 not reachable; A1-3, A1-4, A2-2, A2-5, A2-7, A2-9, A2-10 accepted and documented |
+| Review 3 | H-1, M-1 accepted (compromised owner Safe; unearned protocol budgets only); L-1 and I-1 fixed; I-2, I-4 documented; I-3 moot |
 | Re-review of the fixes | No Critical/High/Medium. Its three Lows fixed: a pending treasury no longer survives an ownership handover (L-1), 8-day treasury delay with recoveries callable by the current treasury (L-2), strict handover check in the deploy script (L-3); plus gas-capped balance reads (I-3) and documented gas limits (I-1, I-2) |
 
 ## Test evidence
@@ -176,9 +195,9 @@ On the current sources (hashes above):
 
 | Suite | Result |
 |---|---|
-| Vault unit tests (`npm test`, `test/vault/`) | 142 passing |
+| Vault unit tests (`npm test`, `test/vault/`) | 149 passing (including the review 3 regressions) |
 | Vault randomized model, soak (`npm run test:soak`) | 16 seeds passing (now with a third reward token's remove / re-add / expire lifecycle and treasury handovers) |
-| Vault mainnet fork (`npm run test:fork:vault`) | 7 passing (blocks 84,772,813, 84,853,444 and, on the current source, 84,957,009) |
+| Vault mainnet fork (`npm run test:fork:vault`) | 7 passing (on the current source at the latest block on 2026-10-10; earlier runs at 84,772,813, 84,853,444, 84,957,009) |
 | Zap unit tests (`npm test`, `test/zap/`) | 70 passing + 5 deploy-script helper tests |
 | Zap deploy script end to end (`npm run test:deploy`) | 11 passing against a local Hardhat node |
 | Zap mainnet fork (`npm run test:fork:zap`) | 8 passing (at the estimate + 10%, the documented rule) |

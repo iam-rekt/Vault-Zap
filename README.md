@@ -102,7 +102,7 @@ behaviour, not real gas costs.
 
 | Suite | Tests (last run, 2026-10-10) |
 |---|---|
-| `npm test` | 217 passing (142 vault, 70 zap, 5 zap deploy-script helpers), 21 pending (the fork and local-node suites, run by the commands below) |
+| `npm test` | 224 passing (149 vault, 70 zap, 5 zap deploy-script helpers), 21 pending (the fork and local-node suites, run by the commands below) |
 | `npm run test:soak` | 16 passing |
 | `npm run test:deploy` | 11 passing |
 | `npm run test:fork` | vault 7 passing, zap 8 passing |
@@ -129,9 +129,9 @@ npm run deploy:vault -- --config config/vault.json --dry-run
 |---|---|
 | `pulp` | The token to lock ($PULP: `0xBc2283d12B1f2f46c1613AE672E95C55b69Ca414`). Checked to be an ERC-20 contract. |
 | `weth` | The wrapped native token rewards are paid in (`0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73`). Must accept ETH through `deposit()`. |
-| `distributor` | The fee wallet allowed to fund rewards (`notifyRewardETH` / `notifyRewardAmount`). More can be added (`extraDistributors`). |
-| `owner` | The **final owner, a multisig**. No default. On Robinhood Chain it must be a contract unless `--allow-eoa-owner`; never the deployer, $PULP, WETH or the PoolManager. |
-| `treasury` | Receives the compound fee and every recovery, nothing else. No default; never a token, the PoolManager or the vault. A multisig is safest. Changing it later takes at least 8 days, and only once every funded reward has been earned. |
+| `distributor` | The fee wallet allowed to fund rewards (`notifyRewardETH` / `notifyRewardAmount`), for example an EOA. More can be added (`extraDistributors`); the owner can add or remove distributors later. |
+| `owner` | The **final owner, a Safe multisig**. No default. On Robinhood Chain it must be a contract unless `--allow-eoa-owner`; never the deployer, $PULP, WETH or the PoolManager. |
+| `treasury` | Receives the compound fee and every recovery, nothing else. No default; never a token ($PULP, WETH or a known one), the PoolManager or the vault. Use a Safe multisig. Changing it later takes at least 8 days, and only once every funded reward has been earned. |
 | `launchStart` | The day locking opens, as a UTC date (`2026-10-20`) or unix time. **Always 00:00 UTC**, at least two hours ahead. Dates that don't exist are refused. |
 | `earlyWindowHours` | The launch bonus window: 2× at launch falling to 1× over this many hours (example 24; under 1 needs `--force`). |
 | `minLockAmountTokens` | The minimum new lock in whole tokens. **Default 35,000** $PULP. Fixed forever once deployed; re-check its dollar value first. It is also the cost of the `lockFor` griefing described in [docs/TECHNICAL.md](docs/TECHNICAL.md#griefing-through-lockfor). |
@@ -197,6 +197,14 @@ address into a frontend's `lock/config.js`). Details: [docs/TECHNICAL.md](docs/T
 2. Decide the distributor, the owner multisig and the treasury, and how often the distributor funds (weekly is enough).
 3. Dry-run both deploys on the real chain; deploy; have the multisig accept ownership of both and check it.
 4. Do one small real lock and one small zap before announcing.
+
+## Roles
+
+| Role | Who | What it does |
+|---|---|---|
+| **Owner** | A Safe multisig | Settings (pause new locks, compound fee within 0–2%, distributors), which reward-token types exist (add / remove), proposing a treasury, and the one-way emergency exit. Can't take principal or earned rewards. |
+| **Distributor(s)** | Wallets the owner whitelists, for example the fee wallet (an EOA is fine) | The only addresses that fund rewards: `notifyRewardETH()` (or a plain ETH transfer) and `notifyRewardAmount(token, amount)`. Funding only adds; a distributor can't take anything out. Adding reward-token *types* stays with the owner. |
+| **Treasury** | Set at deploy (use a Safe); changes only two-step (below) | Receives the compound fee, mistaken transfers (`recoverERC20` / `recoverExcess`), rewards released after an emergency exit and expired unclaimed rewards. It can trigger those recoveries itself. |
 
 ## What the owner can and can't do
 
@@ -298,9 +306,12 @@ protect a ledger two registered addresses share. Details: [docs/TECHNICAL.md](do
   every funded reward is earned (A1-2), reward-token slots can't deadlock (10 retired slots and a 120-day claim
   deadline, A1-1, A2-4), and token addresses are refused as reward tokens or beneficiaries where they would be a
   typo (A2-3, A2-6). **These fixes have not been externally reviewed yet; the zap has had no external audit.**
-- Results of the internal reviews: no Critical or High findings at any stage. The checklist audit's three Mediums (exit-day/treasury owner trust,
-  bridge gas estimation, sandwiches on a thin pool) and all Lows are fixed or documented, and the re-review's three
-  Lows are fixed.
+- Results of the internal reviews: the checklist audit's three Mediums (exit-day/treasury owner trust, bridge gas
+  estimation, sandwiches on a thin pool) and all Lows are fixed or documented, and the re-review's three Lows are
+  fixed. A later adversarial review of the A1/A2 fixes (review 3) found H-1 and M-1, two ways a **compromised owner
+  Safe** could still route the protocol's own *unearned* reward budgets to a new treasury (never principal or earned
+  rewards): accepted as owner-trust residuals and documented. Its L-1 (a gas "return bomb" in recovery balance reads)
+  and I-1 (the treasury check now also refuses WETH and expired tokens) are fixed.
 - Tests on the final sources: see the table under Quick start.
 
 Full findings, fixes and evidence: [docs/SECURITY.md](docs/SECURITY.md).

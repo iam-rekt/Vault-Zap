@@ -1,9 +1,9 @@
 {
   "pulp": "REQUIRED_TOKEN_ADDRESS",
   "weth": "REQUIRED_WRAPPED_NATIVE_ADDRESS",
-  "owner": "REQUIRED_OWNER_MULTISIG_ADDRESS",
+  "owner": "REQUIRED_OWNER_SAFE_MULTISIG_ADDRESS",
   "distributor": "REQUIRED_FEE_DISTRIBUTOR_ADDRESS",
-  "treasury": "REQUIRED_TREASURY_ADDRESS",
+  "treasury": "REQUIRED_TREASURY_SAFE_ADDRESS",
   "launchStart": "REQUIRED_UTC_DATE_LIKE_2026-10-20",
   "earlyWindowHours": 24,
   "minLockAmountTokens": "35000",

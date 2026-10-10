@@ -72,7 +72,8 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     uint256 private constant BPS = 10_000;
     // Granularity of the lock-end index used once, at the switch (see `_scheduledAfter`). Divides DAY.
     uint256 private constant END_BUCKET = 600;
-    // Gas for each `balanceOf` read in the recovery reserve check (a hostile token can't eat the rest).
+    // Gas for each `balanceOf` read in the recovery reserve check (a hostile token can't eat the rest). Only
+    // the first 32 bytes of the answer are ever copied (see `_tryBalance`), so a read can't cost more than this.
     uint256 private constant BALANCE_READ_GAS = 100_000;
 
     struct Config {
@@ -1080,11 +1081,21 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         }
     }
 
-    /// @dev At most BALANCE_READ_GAS for the call, so a token can't consume the caller's whole gas.
-    function _tryBalance(address token) private view returns (bool ok, uint256 balance) {
-        (bool success, bytes memory data) =
-            token.staticcall{gas: BALANCE_READ_GAS}(abi.encodeCall(IERC20.balanceOf, (address(this))));
-        if (success && data.length >= 32) return (true, abi.decode(data, (uint256)));
+    /// @dev At most BALANCE_READ_GAS for the call, so a token can't consume the caller's whole gas, and a
+    ///      fixed 32-byte output buffer: whatever else the token returns is never copied into memory (a
+    ///      high-level call copies all of it, so a "return bomb" could make each read cost millions of gas).
+    ///      Succeeds only if the call succeeded and returned at least 32 bytes.
+    function _tryBalance(address token) private view returns (bool ok, uint256 value) {
+        bytes4 selector = IERC20.balanceOf.selector;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40) // calldata built past the free memory pointer, never allocated
+            mstore(ptr, selector)
+            mstore(add(ptr, 0x04), address())
+            // The answer goes to the scratch space at 0x00; at most its first 32 bytes are written.
+            let success := staticcall(BALANCE_READ_GAS, token, ptr, 0x24, 0x00, 0x20)
+            ok := and(success, gt(returndatasize(), 0x1f))
+            if ok { value := mload(0x00) }
+        }
     }
 
     function _zeroFloorSub(uint256 a, uint256 b) private pure returns (uint256) {
@@ -1115,10 +1126,14 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         ) revert InvalidBeneficiary();
     }
 
-    /// @dev Never the vault (fees would stay in the balance but leave `reserved`), PULP or a reward token.
+    /// @dev Never the vault (fees would stay in the balance but leave `reserved`), PULP, WETH, a reward token
+    ///      (active or retired) or an expired one: token contracts can't move what they receive (typo protection).
+    ///      WETH is refused by address too, so it stays refused even after it is removed as a reward token.
     function _checkTreasury(address t) private view {
         if (t == address(0)) revert ZeroAddress();
-        if (t == address(this) || t == address(pulp) || _hasBooks(t)) revert InvalidTreasury();
+        if (
+            t == address(this) || t == address(pulp) || t == weth || _hasBooks(t) || isExpiredRewardToken[t]
+        ) revert InvalidTreasury();
     }
 
     function _checkCapacity(uint256 amount) private view {

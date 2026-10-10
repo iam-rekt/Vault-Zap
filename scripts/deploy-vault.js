@@ -554,14 +554,14 @@ async function main() {
   const role = (label) => (t) => { const a = toAddress(t); refuseTestAccount(chainId, a, label); return a; };
   const distributor = await setting(cfg, 'distributor', 'fee distributor (the wallet that sends trading fees to the vault)', role('fee distributor'), deployer.address);
   // no default: the final owner is always given, and is never the deployer's hot key, a token or the pool
-  const owner = await setting(cfg, 'owner', 'final owner (a multisig; it accepts ownership itself, in a second step)', async (t) => {
+  const owner = await setting(cfg, 'owner', 'final owner (a Safe multisig; it accepts ownership itself, in a second step)', async (t) => {
     const a = checkFinalOwner(toAddress(t), { deployer: deployer.address, pulp: pulp.address, weth: weth.address, chainId });
     const eoa = await ownerCheck(provider, a, chainId, o.allowEoaOwner);
     if (eoa) say(yellow(`  heads up: ${a} has no contract code${chainId === ROBINHOOD.chainId ? ' (allowed by --allow-eoa-owner)' : ''}. a multisig is safest.`));
     return a;
   });
   // no default: everything the owner can ever recover goes here, and only here
-  const treasury = await setting(cfg, 'treasury', 'treasury (receives the compound fee and everything recovered; a multisig)',
+  const treasury = await setting(cfg, 'treasury', 'treasury (receives the compound fee and everything recovered; a Safe multisig)',
     (t) => checkTreasuryAddress(toAddress(t), { pulp: pulp.address, weth: weth.address, vault: predicted, chainId }));
   if (treasury === deployer.address) say(yellow('  heads up: the treasury is the deployer’s hot key. a multisig is safest; it can be changed later (two-step, at least 8 days).'));
   else if (isEoaCode(await provider.getCode(treasury))) say(yellow(`  note: the treasury ${treasury} is an EOA (no contract code): one key receives the compound fee and every recovery. allowed, but a multisig is safest; changing it later takes at least 8 days.`));
