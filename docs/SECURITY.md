@@ -31,9 +31,15 @@ The audit reports are not part of this repository.
 | A1-1 | Reward-token registries could deadlock: retiring needs a retired slot (max 5), reactivating an active slot (max 5), and a retired token never leaves because rounding dust or unclaimed rewards keep `notified != paid + released` | **Fixed.** Up to 10 retired tokens (`MAX_RETIRED_REWARD_TOKENS`; active stays 5) and a 120-day claim deadline: `CLAIM_DEADLINE` after a token is retired (`retiredAt`), anyone can `expireRewardToken(token)`. Everything still owed moves to `totalReleased` (sweepable to the treasury), the token leaves the retired list and loses its books (claims revert `NotRewardToken`), and it can never be added again (`ExpiredRewardToken`), so old day budgets and cursors can't pay twice. Every loop over the lists stays bounded (16 capped balance reads per recovery check, 15 × 8 reads in `acceptTreasury`) |
 | A2-4 | A retired token's closed zero-power day budgets were stuck: recycling needs an active token, releasing needs the exit | **Fixed** by the expiry: they are part of what is still owed and are released with it |
 | A2-3, A2-6 | `_addRewardToken` accepted the vault itself (and protocol contracts); `_checkBeneficiary` (`lockFor`, `increaseAmountFor`, `claimTo`, `claimAllTo`) refused only zero and the vault | **Fixed** as far as the vault can know: `addRewardToken` refuses the vault (`InvalidRewardToken`), the treasury and a pending treasury (as before) and expired tokens; beneficiaries also refuse PULP, WETH and every token with reward books or expired (`InvalidBeneficiary`). The zap, PoolManager and hook are unknown to the vault: the zap refuses them as beneficiaries itself, and the owner must never register them as reward tokens |
-| A2-8 | (see the report) | **Accepted:** not reachable with the real tax hook, whose only external call forwards 50k gas |
-| Documented | The pause does not cover `extend`; `RewardPaid` may log an amount of 0; alias / shared-ledger tokens | Documented in [TECHNICAL.md](TECHNICAL.md): the pause gates only incoming principal and leaving `extend` open is intentional; every settled page logs `RewardPaid`, also when it pays 0; alias or shared-ledger tokens must never be registered as reward tokens, since the per-token reserve check cannot protect a shared ledger |
-| A1-3, A1-4, A2-1, A2-2, A2-5, A2-7, A2-9, A2-10 | Not changed in the code | Documented or accepted as recorded in the audit reports (the "Documented" row above lists what this repository's docs now say) |
+| A1-3 | Two token addresses sharing one balance ledger pass the per-token reserve check (each address is checked against its own liability, not the sum) | **Accepted, documented.** Only reachable if the owner registers such a token; PULP and WETH are not. Alias or shared-ledger tokens must never be registered as reward tokens |
+| A1-4 | Anyone can open a lock for another address; a zap then tops it up and can end sooner than the length the user asked for | **Accepted, documented** (design: the attacker gives away at least `minLockAmount`; nothing is stolen). See ZAP.md |
+| A2-1 | A compromised owner can halt future rewards and route up to ~8 days of unearned budgets to the treasury | **Fixed with A1-2** for treasury changes: a new treasury can't receive rewards funded before it was accepted. Routing unearned budgets to the *current* treasury through the exit remains an owner power (documented trust assumption); earned rewards and principal are never reachable |
+| A2-2 | `exitDayTotalArea` uses a subtraction that floors at zero | **Accepted.** Correct as written (the auditor agrees); it only matters for future code changes, which the differential fuzz and mutation tests catch |
+| A2-5 | Pausing does not pause `extend` | **Accepted, documented:** the pause gates only incoming principal, by design |
+| A2-7 | `RewardPaid` is emitted with amount 0 on pages that pay nothing | **Accepted, documented** for indexers |
+| A2-8 | A hostile pool hook could open a lock for the beneficiary in the middle of a zap | **Not reachable** with the real tax hook: its code is fixed and its only external call forwards 50k gas, far below a lock (~1.7M) |
+| A2-9 | An OrRefund failure that used over 7/8 of the hop's gas is reported as `InsufficientGas` instead of refunded | **Accepted:** practically unreachable (the auditor agrees); real failures happen early in the hop |
+| A2-10 | If a reward token's balance falls below what is owed, the last claimers bear the shortfall | **Accepted, documented** token trust assumption (reward tokens must be plain ERC-20s) |
 
 ## Review 1 and 2 (internal reviews)
 
@@ -161,7 +167,7 @@ whether L1 force inclusion bypasses Robinhood's filter; Timeboost.
 | M-B bridge gas | Fixed in the zap (an out-of-gas hop reverts `InsufficientGas`). Across must be used with `fallbackRecipient = 0` (its handler's own catch otherwise swallows the revert); locks at estimate + 10% through the real Across and Relay contracts |
 | M-C sandwiches | Mitigated: optional `minSqrtPriceX96`; frontend slippage 0.5% floor / 3% max, price-impact warning from 2%, refusal above 5% |
 | Lows | All fixed or documented: DOS-1, EF-1, EF-4, AC-2/DOS-2, AC-3 + E2E-4, AC-5/AC-6, CB-2/CB-3/AMM-2/AMM-3/GA-1 (docs, trust table, frontend limits), GA-4/AC-7, MS-3, DOS-3/EF-5, GA-3 |
-| External audits A1, A2 | A1-1, A1-2, A2-3, A2-4, A2-6 fixed (above); A2-8 accepted; the documentation points added |
+| External audits A1, A2 | A1-1, A1-2, A2-3, A2-4, A2-6 fixed (A2-1 with A1-2); A2-8 not reachable; A1-3, A1-4, A2-2, A2-5, A2-7, A2-9, A2-10 accepted and documented |
 | Re-review of the fixes | No Critical/High/Medium. Its three Lows fixed: a pending treasury no longer survives an ownership handover (L-1), 8-day treasury delay with recoveries callable by the current treasury (L-2), strict handover check in the deploy script (L-3); plus gas-capped balance reads (I-3) and documented gas limits (I-1, I-2) |
 
 ## Test evidence
@@ -175,15 +181,12 @@ On the current sources (hashes above):
 | Vault mainnet fork (`npm run test:fork:vault`) | 7 passing (blocks 84,772,813, 84,853,444 and, on the current source, 84,957,009) |
 | Zap unit tests (`npm test`, `test/zap/`) | 70 passing + 5 deploy-script helper tests |
 | Zap deploy script end to end (`npm run test:deploy`) | 11 passing against a local Hardhat node |
-| Zap mainnet fork (`npm run test:fork:zap`) | 7 of 8 passing at block 84,957,009 (see the note below) |
+| Zap mainnet fork (`npm run test:fork:zap`) | 8 passing (at the estimate + 10%, the documented rule) |
 | End-to-end suite on a 4663 fork (separate, not in this repository; run on the previous vault source) | 22/22 with the real PULP, WETH, PoolManager, hook, pool, Across and Relay contracts; a frontend was also driven in a browser against a local fork (lock with ETH, top-up, guardrails, claim, compound) |
 
-**Open: one zap fork case.** On today's chain state (block 84,957,009) the zap fork test "eth_estimateGas on the
-OrRefund call, then send at exactly the estimate" fails for its new 30-day `zapWETHOrRefund` case: the call sent at
-exactly the estimate reverts `InsufficientGas` instead of locking. It fails the same way with the previous,
-externally audited vault source, so it does not come from the vault changes; it is a gas-margin question for the zap
-(M-B) on current state and is not fixed here (the zap was not changed). Bridges are told to add at least 10% to the
-estimate; this WETH case was not re-measured with that margin here.
+**Zap fork, gas estimates.** Sending an OrRefund call at *exactly* its gas estimate can fall about 40k short (the
+vault's gas depends on where the lock's end falls in its 10-minute bucket); it then reverts `InsufficientGas`, never
+refunds. The fork test sends at the documented estimate + 10% and every case locks.
 
 Coverage highlights: the vault's randomized model checks every lock, power, claimable amount, wallet and the
 vault's balances against an independent BigInt model after every action, including exit-day payouts against

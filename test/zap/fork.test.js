@@ -167,7 +167,10 @@ const enabled = process.env.FORK === '1';
     await clean();
   });
 
-  it('M-B: eth_estimateGas on the OrRefund call -> send at exactly the estimate -> Zapped (new 10/30-day, top-up, WETH); impossible minOut -> Refunded', async function () {
+  // The documented rule (BRIDGES.md, README): the estimate + 10%. An exact estimate can fall ~40k short, because the
+  // vault's gas depends on where the lock's end falls in its 10-minute bucket; too little gas reverts InsufficientGas,
+  // never refunds (covered by the gas-sweep test above).
+  it('M-B: eth_estimateGas on the OrRefund call -> send at the estimate + 10% -> Zapped (new 10/30-day, top-up, WETH); impossible minOut -> Refunded', async function () {
     const s = await ethers.getSigners();
     const eth = WAD / 1000n;
     const [, netIn] = await zap.quoteFee(eth);
@@ -176,7 +179,7 @@ const enabled = process.env.FORK === '1';
     const out = [];
     const run = async (label, fn, args, ov) => {
       const est = await zap[fn].estimateGas(...args, ov);
-      const { r, ev } = await sent(zap[fn](...args, { ...ov, gasLimit: est }));
+      const { r, ev } = await sent(zap[fn](...args, { ...ov, gasLimit: (est * 11n) / 10n }));
       out.push(`${label}: estimate ${est}, used ${r.gasUsed} -> ${ev.name}`);
       return ev.name;
     };

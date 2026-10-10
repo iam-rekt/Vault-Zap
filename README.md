@@ -105,7 +105,7 @@ behaviour, not real gas costs.
 | `npm test` | 217 passing (142 vault, 70 zap, 5 zap deploy-script helpers), 21 pending (the fork and local-node suites, run by the commands below) |
 | `npm run test:soak` | 16 passing |
 | `npm run test:deploy` | 11 passing |
-| `npm run test:fork` | vault 7 passing, zap 7 of 8 (one gas-estimate case, see [docs/SECURITY.md](docs/SECURITY.md#test-evidence)) |
+| `npm run test:fork` | vault 7 passing, zap 8 passing |
 
 ## Deploy
 
