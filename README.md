@@ -1,4 +1,6 @@
-# paperdao-contracts
+# Vault-Zap
+
+Created by **iamrekt**.
 
 Two Solidity contracts for **$PULP** on Robinhood Chain (chain id 4663), with their tests, deploy scripts and
 design notes:
