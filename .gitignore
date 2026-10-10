@@ -1,0 +1,11 @@
+node_modules/
+artifacts/
+cache/
+coverage/
+coverage.json
+.env
+.env.*
+deployments/*.json
+!deployments/README.md
+*.log
+.DS_Store

@@ -1,0 +1,44 @@
+{
+  "name": "paperdao-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PulpVeVault (lock $PULP, earn a share of the trading tax) and PulpZap (ETH/WETH -> $PULP on Uniswap v4 -> lock, in one transaction)",
+  "license": "MIT",
+  "scripts": {
+    "build": "hardhat compile",
+    "test": "hardhat test",
+    "test:vault": "hardhat test test/vault/locks.test.js test/vault/rewards.test.js test/vault/delegated.test.js test/vault/emergency.test.js test/vault/fixes.test.js test/vault/treasury.test.js test/vault/security.test.js test/vault/deploy.test.js test/vault/model.test.js",
+    "test:zap": "hardhat test test/zap/zap.test.js test/zap/deploy.test.js",
+    "test:soak": "PULP_MODEL_EXTRA_SEEDS=12 PULP_MODEL_ACTIONS=160 hardhat test test/vault/model.test.js",
+    "test:fork": "FORK=1 hardhat test test/vault/fork.test.js && FORK=1 hardhat test test/zap/fork.test.js",
+    "test:fork:vault": "FORK=1 hardhat test test/vault/fork.test.js",
+    "test:fork:zap": "FORK=1 hardhat test test/zap/fork.test.js",
+    "test:deploy": "DEPLOY_E2E=1 hardhat test test/zap/deploy.test.js",
+    "deploy:vault": "npm run build && node scripts/deploy-vault.js",
+    "deploy:zap": "npm run build && node scripts/deploy-zap.js"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "2.1.2",
+    "@nomicfoundation/hardhat-ethers": "3.1.3",
+    "chai": "4.5.0",
+    "ethers": "6.17.0",
+    "hardhat": "2.29.1",
+    "solc": "0.8.28"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "5.4.0"
+  },
+  "overrides": {
+    "adm-zip": "0.6.1",
+    "cookie": "0.7.2",
+    "diff": "8.0.3",
+    "serialize-javascript": "7.0.5",
+    "tmp": "0.2.7",
+    "undici": "6.28.1",
+    "uuid": "11.1.1",
+    "ws": "8.21.0"
+  },
+  "engines": {
+    "node": ">=22 <23"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "vault": "REQUIRED unless deployments/ has the vault record from npm run deploy:vault: the deployed PulpVeVault",
+  "owner": "REQUIRED: final owner, a multisig (it calls acceptOwnership after the deploy)",
+  "feeRecipient": "REQUIRED: the treasury (receives the zap fee and anything swept)",
+  "zapFeeBps": 50
+}
