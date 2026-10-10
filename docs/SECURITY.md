@@ -56,8 +56,8 @@ the reviewer's proofs of concept: `test/vault/review3.test.js`.
 | L-1 | Low | Return bomb: `_tryBalance` used a high-level `staticcall` that copied all returndata into memory, so 15 hostile reward tokens made a recovery cost up to ~69M gas | **Fixed.** Assembly `staticcall` with the 100k gas cap and a fixed 32-byte output buffer; a read counts only if the call succeeds and returns at least 32 bytes. With 15 return-bomb tokens (5 active + 10 retired): `recoverExcess` 3.10M gas, `recoverERC20` 3.12M (gas-burning tokens 3.26M / 3.28M; normal 0.40M / 0.42M) |
 | I-1 | Info | Treasury validation | **Fixed:** `_checkTreasury` (constructor, `proposeTreasury`, `acceptTreasury`) also refuses WETH by address (so also after WETH is removed) and expired reward tokens |
 | I-2 | Info | The reward-token registry can be kept full | **Documented:** a full registry can block removals for up to 120 days (until retired tokens can be expired); per-token `claim`/`claimTo` always works meanwhile |
-| I-3 | Info | (see the review) | Moot for the current design; no change |
-| I-4 | Info | Owner griefing through hostile reward tokens (for example delaying recoveries with a vetoing `balanceOf`) | **Documented** owner-trust assumption: the owner can delay, never take, and principal and earned rewards stay reachable |
+| I-3 | Info | Can `acceptTreasury` be blocked forever (permissionless releases restarting the 8-day clock, recycling, dust funding)? | **Bounded, no change:** after the exit the owner can release or expire everything at once (all permissionless); before it, endless recycling needs an empty vault and stops once anyone (the owner too) locks; a dusting distributor is revoked with `setDistributor` |
+| I-4 | Info | The owner can register a user's contract wallet as a "reward token", after which that address is refused as a beneficiary (`lockFor`/`claimTo` to it); a hostile reward token can also delay recoveries | **Documented** owner-trust assumption: owner griefing only; the user's own `withdraw` and `claim` are unaffected, and principal and earned rewards stay reachable |
 
 ## Review 1 and 2 (internal reviews)
 
