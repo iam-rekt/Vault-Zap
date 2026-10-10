@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
-/// @dev The subset of PulpVeVault (paperdao-vault/contracts/PulpVeVault.sol) that PulpZap calls.
+/// @dev The subset of PulpVeVault that PulpZap calls.
 interface IPulpVeVault {
     function pulp() external view returns (address);
     function minLockAmount() external view returns (uint256);

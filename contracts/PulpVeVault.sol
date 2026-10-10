@@ -15,32 +15,23 @@ interface IWrappedNative {
 
 /**
  * @title PulpVeVault
- * @notice Exact 10/20/30-day PULP locks with linearly decaying reward power.
- * @dev Not a voting token and not an upgradeable proxy. Power is
- *      amount * savedEntryMultiplier * remainingTime / 30 days.
+ * @notice Lock PULP for exactly 10, 20 or 30 days and earn a share of the reward tokens (the trading tax).
+ *         Reward power = amount * entry multiplier * remaining time / 30 days, decaying linearly.
+ * @dev Not a voting token, not upgradeable. Rewards are funded over the next seven full UTC days and each
+ *      day's budget is split by the exact integral of power over that day. Closed days never change.
  *
- *      Rewards settle by UTC day, proportional to the INTEGRAL of power during
- *      that day, not a single snapshot or the integral of instantaneous shares.
- *      Funding is additive across seven full FUTURE days. Closed-day weights
- *      and reward budgets cannot be changed by deposits or extensions.
+ *      Roles: owner (Ownable2Step, cannot renounce): reward tokens, distributors, pause of new principal,
+ *      compound fee (<= 2%), treasury proposals, one-way emergency exit, recoveries. Distributors: fund
+ *      rewards. Treasury: receives compound fees and everything recovered; may trigger recoveries itself.
  *
- *      Each position change schedules at most 31 days of exact integer areas.
- *      Twice the area is stored, including the 1e18 multiplier scale, so no
- *      rounding occurs in area bookkeeping. Only final payouts round down.
+ *      Guarantees:
+ *      - principal is always withdrawable at lock end (after an emergency exit: at any time);
+ *      - earned rewards stay claimable forever, also for removed ("retired") reward tokens;
+ *      - recoveries never touch principal or owed rewards (`reserved`);
+ *      - the treasury changes only by a two-step handover, accepted at least TREASURY_DELAY (8 days) after
+ *        the public proposal.
  *
- *      The owner's one-way `enableEmergencyExit` lets every lock withdraw at once and stops new
- *      principal, extensions and funding. It moves no tokens. Rewards stop at the switch second
- *      `exitTimestamp`: every day before the exit day is paid as usual; the exit day is paid as if it
- *      had ended at the switch (its budget times the elapsed fraction of the day, split by the area each
- *      lock accrued before the switch); the rest of the exit day and every later day go back to the
- *      treasury (`releasePostExitRewards`/`releaseEmptyRewards`, then `recoverExcess`). Everything the
- *      owner can recover goes only to `treasury`, which changes only by a two-step handover that the new
- *      address can complete no sooner than TREASURY_DELAY (8 days) after the proposal (a public notice).
- *      The treasury itself may also trigger recoveries, so a sweep can never be held back until a new
- *      treasury takes over. Recoveries never touch principal or earned rewards: those stay claimable forever.
- *
- *      A removed reward token that is still owed is "retired": still claimable with `claim`/`claimTo`
- *      forever, still reserved and protected, and it can be added again.
+ *      Design and proofs: docs/TECHNICAL.md.
  */
 contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -49,24 +40,24 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     uint256 public constant MIN_LOCK_TIME = 10 days;
     uint256 public constant MAX_LOCK_TIME = 30 days;
     uint256 public constant WAD = 1e18;
+    // Days a funding is spread over, starting tomorrow (or the launch day).
     uint256 public constant REWARD_DAYS = 7;
-    // Active reward tokens (claimAll pays them; only they can be funded).
+    // Active reward tokens (paid by claimAll, fundable).
     uint256 public constant MAX_REWARD_TOKENS = 5;
-    // Removed tokens still owed (retired): claimable forever with `claim`/`claimTo`.
+    // Removed but still owed tokens (claimable with claim/claimTo).
     uint256 public constant MAX_RETIRED_REWARD_TOKENS = 10;
+    // Max recorded days settled per claim page.
     uint256 public constant MAX_CLAIM_EPOCHS = 64;
-    // Bounds boosted principal and all 31-day area arithmetic well below uint256.
+    // Keeps boosted principal and all area arithmetic far below uint256.
     uint256 public constant MAX_TOTAL_LOCKED = type(uint128).max;
-    // Hard cap on the compound fee: 2%. The owner can lower or raise it within this, never past it.
+    // Hard cap on the compound fee, in bps (2%).
     uint16 public constant MAX_COMPOUND_FEE_BPS = 200;
-    // A proposed treasury can accept only this long after the proposal, so the community has 8 days to react
-    // to `TreasuryProposed`.
+    // Minimum time between proposeTreasury and acceptTreasury.
     uint256 public constant TREASURY_DELAY = 8 days;
     uint256 private constant BPS = 10_000;
-    // Granularity of the lock-end index used once, at the switch (see `_scheduledAfter`). Divides DAY.
+    // Seconds per bucket of the lock-end index read by enableEmergencyExit. Divides DAY.
     uint256 private constant END_BUCKET = 600;
-    // Gas for each `balanceOf` read in the recovery reserve check (a hostile token can't eat the rest). Only
-    // the first 32 bytes of the answer are ever copied (see `_tryBalance`), so a read can't cost more than this.
+    // Gas cap for each balanceOf read in the recovery reserve check.
     uint256 private constant BALANCE_READ_GAS = 100_000;
 
     struct Config {
@@ -75,26 +66,26 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         address owner;
         address distributor;
         uint256 launchStart; // 00:00 UTC of some day
-        uint256 earlyWindow;
+        uint256 earlyWindow; // seconds over which the entry multiplier falls from 2x to 1x
         uint256 minLockAmount;
         uint16 compoundFeeBps; // <= MAX_COMPOUND_FEE_BPS
-        address treasury; // receives compound fees and everything recovered; required
+        address treasury; // required
     }
 
     struct Lock {
-        uint256 amount;
-        // Sum of amount_i * entryMultiplier_i (WAD), with no division/rounding.
+        uint256 amount; // PULP principal
+        // Sum of amount_i * entryMultiplier_i (WAD-scaled), unrounded.
         uint256 boosted;
-        uint256 end;
+        uint256 end; // unlock timestamp
     }
 
-    // A lock's trajectory at the switch, kept when that lock is withdrawn after it (only if it ran past it).
+    // A lock's trajectory at the emergency exit, kept if it is withdrawn while it would still have run.
     struct ExitLock {
         uint192 boosted;
         uint64 end;
     }
 
-    // Sums over live lock trajectories ending in one END_BUCKET (r = end % END_BUCKET) or one day (r = end % DAY).
+    // Sums over live trajectories ending in one END_BUCKET (r = end % END_BUCKET) or one day (r = end % DAY).
     struct BucketEnds {
         uint256 boosted;
         uint256 boostedR;
@@ -115,47 +106,41 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     mapping(address => Lock) public locks;
     uint256 public totalLocked;
     bool public locksPaused;
-    // Packed with locksPaused. Receives compound fees and everything `recoverERC20`/`recoverExcess` move.
-    // Set at deploy; changes only by `proposeTreasury` (owner) + `acceptTreasury` (the new address,
-    // TREASURY_DELAY later).
+    // Receives compound fees and all recoveries. Changes only via proposeTreasury + acceptTreasury.
     address public treasury;
-    // Also packed. Only `compound` charges this; `claim` never does.
+    // Fee on compound only, in bps.
     uint16 public compoundFeeBps;
-    // Also packed. One-way: once true, never false again. See `enableEmergencyExit`.
+    // One-way switch, see enableEmergencyExit.
     bool public emergencyExit;
-    // Also packed. The second the exit was enabled; 0 while `emergencyExit` is off.
+    // Second the emergency exit was enabled; 0 while off.
     uint64 public exitTimestamp;
     address public pendingTreasury;
-    // Packed with pendingTreasury. When the pending proposal was made (0 if none); it can be accepted from
-    // treasuryProposedAt + TREASURY_DELAY. Cleared on acceptance, cancellation and every ownership change.
+    // When pendingTreasury was proposed (0 if none). Cleared on acceptance, cancellation and ownership change.
     uint64 public treasuryProposedAt;
-    // Total area accrued on the exit day before `exitTimestamp` (the denominator for that day's payouts).
+    // Total area accrued on the exit day before exitTimestamp (denominator for that day's payouts).
     uint256 public exitDayTotalArea;
     mapping(address => bool) public isDistributor;
 
-    // Units: 2 * integral(boosted * remainingSeconds dt). Common normalization
-    // factors cancel in userArea / totalArea. Epoch number = timestamp / DAY.
-    // Frozen once the emergency exit is on: nothing writes them after the switch.
+    // Areas, in units of 2 * integral(boosted * remainingSeconds dt), keyed by epoch = timestamp / DAY.
+    // Frozen once the emergency exit is on.
     mapping(uint256 => uint256) public totalEpochArea;
     mapping(address => mapping(uint256 => uint256)) public userEpochArea;
     mapping(address => uint256[]) private _userEpochs;
 
-    // Active reward tokens: claimAll pays these, only these can be funded.
     address[] public rewardTokens;
     mapping(address => bool) public isRewardToken;
-    // Removed while something was still owed: still claimable, reserved and protected, never fundable.
+    // Removed while still owed: claimable, reserved and protected, not fundable.
     address[] private _retiredRewardTokens;
     mapping(address => bool) public isRetiredRewardToken;
     mapping(address => mapping(uint256 => uint256)) public epochRewards;
     mapping(address => mapping(address => uint256)) public claimCursor;
     mapping(address => uint256) public totalNotified;
     mapping(address => uint256) public totalPaid;
-    // Budgets taken off the books after emergency exit: the unearned part of the exit day, every later
-    // day, and closed zero-area days.
+    // Budgets taken off the books after the emergency exit (unearned or empty days).
     mapping(address => uint256) public totalReleased;
 
     mapping(address => ExitLock) private _exitLocks;
-    // Index of live lock trajectories by end second, used only by `enableEmergencyExit`.
+    // Index of live lock trajectories by end second, read only by enableEmergencyExit.
     mapping(uint256 => uint256) private _endsAt;
     mapping(uint256 => BucketEnds) private _endsInBucket;
     mapping(uint256 => DayEnds) private _endsOnDay;
@@ -164,18 +149,17 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     event Increased(address indexed user, uint256 amount, uint256 entryMultiplier, uint256 power);
     event Extended(address indexed user, uint256 oldEnd, uint256 newEnd, uint256 power, bool restarted);
     event Withdrawn(address indexed user, uint256 amount);
-    // After the emergency exit, a lock withdrawn before its end: also logs Withdrawn.
+    // After the emergency exit, a lock withdrawn before its end (also logs Withdrawn).
     event EarlyWithdrawn(address indexed user, uint256 amount, uint256 oldEnd);
-    // From lockFor/increaseAmountFor, after Locked/Increased (whose `user` stays the lock owner).
+    // From lockFor/increaseAmountFor, after Locked/Increased.
     event DepositedFor(address indexed payer, address indexed beneficiary, uint256 amount);
-    // Extra to RewardPaid/Increased: `amount` was re-locked, not transferred; `fee` went to the treasury.
-    // RewardPaid carries the whole page (amount + fee). See docs/TECHNICAL.md (compound fee).
+    // `amount` was re-locked, `fee` sent to the treasury; the preceding RewardPaid logs amount + fee.
     event Compounded(address indexed user, uint256 amount, uint256 fee, uint256 nextCursor);
     event RewardNotified(address indexed token, address indexed funder, uint256 amount);
     event RewardsScheduled(address indexed token, uint256 amount, uint256 firstEpoch, uint256 lastEpoch);
     event EmptyRewardsRecycled(address indexed token, uint256 indexed emptyEpoch, uint256 amount);
     event RewardPaid(address indexed user, address indexed token, uint256 amount, uint256 nextCursor);
-    // claimTo/claimAllTo: the page RewardPaid logged for `user` was sent to `to`.
+    // claimTo/claimAllTo: the page logged by RewardPaid for `user` was sent to `to`.
     event RewardSentTo(address indexed user, address indexed token, address indexed to, uint256 amount);
     event RewardTokenAdded(address indexed token);
     event RewardTokenRemoved(address indexed token, bool retired);
@@ -233,13 +217,13 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         _;
     }
 
-    /// @dev Calls that would add principal, area or reward budget. Emergency exit is checked first.
+    /// @dev Calls that would add principal, area or reward budget.
     modifier whenNotExited() {
         if (emergencyExit) revert EmergencyExitActive();
         _;
     }
 
-    /// @dev Recoveries: the owner, or the treasury (their only destination) pulling what is its own.
+    /// @dev Recoveries: the owner, or the treasury (their only destination).
     modifier onlyOwnerOrTreasury() {
         if (msg.sender != owner() && msg.sender != treasury) revert OwnableUnauthorizedAccount(msg.sender);
         _;
@@ -278,8 +262,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit TreasuryChanged(address(0), c.treasury);
     }
 
-    /// @notice Entry multiplier, from 2e18 at launch immediately down to 1e18.
-    /// @dev A quote before launch does not make deposits possible before launch.
+    /// @notice Entry multiplier (WAD) at `timestamp`: 2e18 at launch, falling linearly to 1e18 over earlyWindow.
     function entryMultiplier(uint256 timestamp) public view returns (uint256) {
         if (timestamp <= launchStart) return 2 * WAD;
         uint256 elapsed = timestamp - launchStart;
@@ -287,27 +270,27 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         return WAD + Math.mulDiv(WAD, earlyWindow - elapsed, earlyWindow);
     }
 
+    /// @notice Current reward power of `user`'s lock (0 once it has ended).
     function powerOf(address user) public view returns (uint256) {
         Lock memory l = locks[user];
         if (block.timestamp >= l.end) return 0;
         return Math.mulDiv(l.boosted, l.end - block.timestamp, MAX_LOCK_TIME * WAD);
     }
 
+    /// @notice Power a new lock of `amount` for `daysLocked` days would start with now.
     function previewPower(uint256 amount, uint256 daysLocked) external view returns (uint256) {
         _checkDuration(daysLocked);
         if (amount > MAX_TOTAL_LOCKED) revert LockCapExceeded();
         return Math.mulDiv(amount * entryMultiplier(block.timestamp), daysLocked * DAY, MAX_LOCK_TIME * WAD);
     }
 
-    /// @notice Deposit for exactly 10, 20 or 30 days, with no calendar rounding.
+    /// @notice Lock `amount` PULP for exactly 10, 20 or 30 days at today's entry multiplier. One lock per address.
     function lock(uint256 amount, uint256 daysLocked) external nonReentrant whenLocksOpen {
         _lock(msg.sender, amount, daysLocked);
     }
 
-    /// @notice Open `beneficiary`'s one lock with the caller's PULP. Same rules as `lock`.
-    /// @dev The position belongs wholly to `beneficiary`; the payer keeps no claim on it. Permissionless,
-    ///      so an address with no lock can be given one, after which its own `lock` reverts LockExists:
-    ///      add to it with `increaseAmount`/`extend` instead. See docs/TECHNICAL.md (delegated deposits).
+    /// @notice Open a lock for `beneficiary`, paid with the caller's PULP. Same rules as `lock`; the lock
+    ///         belongs wholly to `beneficiary`.
     function lockFor(address beneficiary, uint256 amount, uint256 daysLocked)
         external nonReentrant whenLocksOpen
     {
@@ -316,31 +299,25 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit DepositedFor(msg.sender, beneficiary, amount);
     }
 
-    /// @notice New principal gets today's entry multiplier, not the old bonus.
-    /// @dev New capital must still commit for at least 10 days; extend first if needed.
+    /// @notice Add PULP to the caller's lock at today's entry multiplier. The lock must have 10+ days left
+    ///         (extend first otherwise); the unlock time does not change.
     function increaseAmount(uint256 amount) external nonReentrant whenLocksOpen {
         _increase(msg.sender, amount);
     }
 
-    /// @notice Add the caller's PULP to `beneficiary`'s lock. Same rules as `increaseAmount`;
-    ///         it cannot move the unlock time or reprice the existing principal.
+    /// @notice Add the caller's PULP to `beneficiary`'s lock. Same rules as `increaseAmount`.
     function increaseAmountFor(address beneficiary, uint256 amount) external nonReentrant whenLocksOpen {
         _checkBeneficiary(beneficiary);
         _increase(beneficiary, amount);
         emit DepositedFor(msg.sender, beneficiary, amount);
     }
 
-    /// @notice Re-lock one claim page of the caller's closed-day PULP rewards into their own lock,
-    ///         exactly like `increaseAmount` (today's multiplier, 10+ days left, not while paused),
-    ///         minus a fee of `compoundFeeBps` (at most 2%, rounded down) paid to the treasury.
-    ///         Reverts `FeeAboveMax` if the fee is above the caller's `maxFeeBps`, so a fee raised
-    ///         between the quote and the transaction cannot be charged. It is a convenience fee:
+    /// @notice Re-lock one claim page of the caller's PULP rewards into their lock (rules of `increaseAmount`),
+    ///         minus `compoundFeeBps` sent to the treasury. Reverts FeeAboveMax if that fee exceeds `maxFeeBps`.
     ///         `claim(pulp, n)` + `increaseAmount` does the same with no fee.
-    /// @dev The whole page leaves the reward books (totalPaid); `amount` joins principal (totalLocked)
-    ///      and stays in the vault; only `fee` is transferred, last. So `reserved(pulp)` and the PULP
-    ///      balance both drop by exactly `fee`. A page worth zero after the fee reverts
-    ///      NothingToCompound; `claim(pulp, n)` pages past it, fee-free.
-    /// @return amount PULP added to the caller's principal (the page minus the fee).
+    /// @dev The page leaves the reward books (totalPaid) and `amount` joins principal; only `fee` is
+    ///      transferred, so `reserved(pulp)` and the PULP balance both drop by exactly `fee`.
+    /// @return amount PULP added to the caller's principal (page minus fee).
     function compound(uint256 maxEpochs, uint16 maxFeeBps)
         external nonReentrant whenLocksOpen returns (uint256 amount)
     {
@@ -353,19 +330,15 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         (uint256 rewards, uint256 nextCursor) = _settle(msg.sender, token, maxEpochs);
         uint256 fee = Math.mulDiv(rewards, compoundFeeBps, BPS);
         amount = rewards - fee;
-        // Both checks revert the whole settlement above, including cursor and totalPaid.
         if (amount == 0) revert NothingToCompound();
         _checkCapacity(amount);
         _addPrincipal(msg.sender, l, amount);
         emit Compounded(msg.sender, amount, fee, nextCursor);
-        // The only external call, after every state change.
         if (fee != 0) pulp.safeTransfer(treasury, fee);
     }
 
-    /// @notice Reset remaining time to 10/20/30 days from now, not an addition.
-    /// @dev Active extensions keep the saved bonus. At/after expiry, restart at
-    ///      today's entry multiplier. Neither path rewrites already accrued area.
-    ///      Blocked after emergency exit: a lock that no longer binds earns no new area.
+    /// @notice Set the caller's remaining lock time to 10/20/30 days from now (must be later than the current
+    ///         end). An active lock keeps its multiplier; an expired one restarts at today's.
     function extend(uint256 daysLocked) external nonReentrant whenNotExited {
         Lock storage l = locks[msg.sender];
         if (l.amount == 0) revert NoLock();
@@ -384,10 +357,10 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit Extended(msg.sender, oldEnd, newEnd, powerOf(msg.sender), restarted);
     }
 
-    /// @notice Principal exit does not process, discard, or depend on reward claims.
-    /// @dev After emergency exit an active lock can leave too. No area is touched: areas are frozen at
-    ///      the switch, and only area accrued before the switch is ever paid. A lock that ran past the
-    ///      switch leaves its trajectory (boosted, end) behind so its exit-day share stays computable.
+    /// @notice Withdraw the caller's whole principal once the lock has ended (any time after an emergency
+    ///         exit). Independent of reward claims.
+    /// @dev After the exit, a lock that ran past the switch leaves its trajectory in `_exitLocks` so its
+    ///      exit-day share stays computable.
     function withdraw() external nonReentrant {
         Lock memory l = locks[msg.sender];
         if (l.amount == 0) revert NoLock();
@@ -406,7 +379,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         if (early) emit EarlyWithdrawn(msg.sender, l.amount, l.end);
     }
 
-    /// @notice Fund the next seven full UTC days. Existing schedules never move.
+    /// @notice Distributor: fund `amount` of `token`, spread over the next seven full UTC days.
     function notifyRewardAmount(address token, uint256 amount)
         external nonReentrant onlyDistributor whenNotExited
     {
@@ -418,19 +391,18 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         _scheduleRewards(token, amount);
     }
 
-    /// @notice Native fees are wrapped and paid to lockers as the configured wrapped token.
+    /// @notice Distributor: fund with native ETH, wrapped and paid out as WETH.
     function notifyRewardETH() external payable nonReentrant onlyDistributor whenNotExited {
         _fundNative();
     }
 
-    /// @notice A normal native transfer from an authorized distributor also funds rewards.
+    /// @notice A plain ETH transfer from a distributor funds rewards like `notifyRewardETH`.
     receive() external payable nonReentrant onlyDistributor whenNotExited {
         _fundNative();
     }
 
-    /// @notice Re-use a closed day's budget ONLY if nobody accumulated any power.
-    /// @dev Permissionless and single-use. Never recycles rounding dust or unclaimed rewards.
-    ///      After emergency exit future days can only lose area, so use `releaseEmptyRewards` instead.
+    /// @notice Reschedule a closed day's budget over the next seven days if nobody had any power that day.
+    ///         Permissionless; not after the emergency exit.
     function recycleEmptyRewards(address token, uint256 epoch) external nonReentrant whenNotExited {
         if (!isRewardToken[token]) revert NotRewardToken();
         if (epoch >= block.timestamp / DAY) revert EpochNotClosed();
@@ -442,13 +414,8 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit EmptyRewardsRecycled(token, epoch, amount);
     }
 
-    /// @notice After emergency exit, take a day's budget off the books that nobody can ever be paid:
-    ///         any day after the exit day, or an earlier day with zero power.
-    /// @dev Permissionless and single-use. The unearned part of the exit day was already released by
-    ///      the switch; its earned part is owed (`EpochHasPower`) unless nobody accrued area before the
-    ///      switch, in which case the switch released it all. Days before the exit day were all closed
-    ///      before the switch, so their areas are final; one with zero total area can never be earned.
-    ///      The budget leaves `reserved` and only then becomes reachable by `recoverExcess`.
+    /// @notice After the emergency exit, take a day's budget nobody can earn off the books (a day after the
+    ///         exit day, or a day with zero area). Permissionless. Released budgets become recoverable.
     function releaseEmptyRewards(address token, uint256 epoch) external nonReentrant {
         if (!emergencyExit) revert EmergencyExitOff();
         if (!_hasBooks(token)) revert NotRewardToken();
@@ -459,10 +426,9 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         if (_release(token, epoch) == 0) revert NothingToFund();
     }
 
-    /// @notice After emergency exit, release every funded day after the exit day for `token` in one call.
-    /// @dev Permissionless. Every budget was scheduled before the switch, on some day `t <= exitEpoch`, over
-    ///      the seven days from `max(t + 1, launch day)`. So every budget after `exitEpoch` lies in the seven
-    ///      days from `max(exitEpoch + 1, launch day)`. Reverts NothingToFund if none is left.
+    /// @notice After the emergency exit, release every budget of `token` after the exit day in one call.
+    /// @dev All budgets were scheduled on or before the exit day, so any after it lie in the seven days from
+    ///      max(exitEpoch + 1, launch day).
     /// @return amount Total released.
     function releasePostExitRewards(address token) external nonReentrant returns (uint256 amount) {
         if (!emergencyExit) revert EmergencyExitOff();
@@ -472,18 +438,15 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         if (amount == 0) revert NothingToFund();
     }
 
-    /// @notice Claim up to 64 recorded days. Repeat for longer histories.
-    /// @dev Individual-token claiming prevents one bad reward token blocking another. Works for retired
-    ///      (removed but still owed) tokens too, forever.
-    ///      `RewardPaid` is logged for every settled page, also when it pays 0 (the cursor still moves).
+    /// @notice Claim the caller's `token` rewards for up to `maxEpochs` (<= 64) recorded days; repeat for more.
+    ///         Works for retired tokens too.
     function claim(address token, uint256 maxEpochs) external nonReentrant returns (uint256 amount) {
         if (!_hasBooks(token)) revert NotRewardToken();
         _checkClaimLimit(maxEpochs);
         return _claim(msg.sender, token, maxEpochs, msg.sender);
     }
 
-    /// @notice Like `claim`, but the caller's own page is sent to `to` (for example when the caller's
-    ///         address is blocked by the reward token).
+    /// @notice Like `claim`, but sends the caller's page to `to`.
     function claimTo(address token, uint256 maxEpochs, address to) external nonReentrant returns (uint256 amount) {
         if (!_hasBooks(token)) revert NotRewardToken();
         _checkClaimLimit(maxEpochs);
@@ -492,13 +455,13 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit RewardSentTo(msg.sender, token, to, amount);
     }
 
-    /// @notice One page of every active reward token. Retired tokens: use `claim`.
+    /// @notice Claim one page of every active reward token. Retired tokens: use `claim`.
     function claimAll(uint256 maxEpochs) external nonReentrant {
         _checkClaimLimit(maxEpochs);
         for (uint256 i; i < rewardTokens.length; ++i) _claim(msg.sender, rewardTokens[i], maxEpochs, msg.sender);
     }
 
-    /// @notice `claimAll`, sent to `to`.
+    /// @notice Like `claimAll`, but sends everything to `to`.
     function claimAllTo(uint256 maxEpochs, address to) external nonReentrant {
         _checkClaimLimit(maxEpochs);
         _checkBeneficiary(to);
@@ -508,8 +471,8 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         }
     }
 
-    /// @notice FINAL entitlement on the next bounded page; not open-day estimates. Before the exit only
-    ///         closed days; after it every day up to and including the exit day (paid up to the switch).
+    /// @notice Final amount the next claim page would pay (closed days only; after the emergency exit, up to
+    ///         and including the exit day).
     /// @return amount Tokens payable for the page.
     /// @return nextCursor Index after processing the page.
     /// @return caughtUp True if no further payable recorded days remain.
@@ -523,8 +486,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         uint256 limit = Math.min(epochs.length, nextCursor + maxEpochs);
         bool exited = emergencyExit;
         uint256 exitDay = exitEpoch();
-        // First unpayable day: today (still open) or, after the exit, the day after the exit day. Before the
-        // switch a page stopped before today, which is at most the exit day, so no cursor is past it.
+        // First unpayable day: today, or after the exit the day after the exit day.
         uint256 stop = exited ? exitDay + 1 : block.timestamp / DAY;
         while (nextCursor < limit && epochs[nextCursor] < stop) {
             uint256 epoch = epochs[nextCursor];
@@ -543,21 +505,20 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         caughtUp = nextCursor == epochs.length || epochs[nextCursor] >= stop;
     }
 
-    /// @notice The UTC day of the switch (`exitTimestamp / DAY`); 0 while the exit is off.
+    /// @notice UTC day of the emergency exit; 0 while it is off.
     function exitEpoch() public view returns (uint64) {
         return exitTimestamp / uint64(DAY);
     }
 
-    /// @notice Area `user` accrued on the exit day before the switch (0 while the exit is off). That day
-    ///         pays `epochRewards(token, exitEpoch)` (already scaled to the elapsed part of the day) times
-    ///         this over `exitDayTotalArea`.
+    /// @notice Area `user` accrued on the exit day before the switch (0 while the exit is off).
+    /// @dev The day's scheduled area minus the part after the switch, from the live lock or, if withdrawn,
+    ///      the trajectory it left in `_exitLocks`.
     function exitDayArea(address user) public view returns (uint256) {
         if (!emergencyExit) return 0;
         uint256 x = exitTimestamp;
         uint256 day = x / DAY;
         uint256 area = userEpochArea[user][day];
         if (area == 0) return 0;
-        // The trajectory that ran at the switch: the lock itself, or what it left behind when withdrawn.
         Lock storage l = locks[user];
         uint256 boosted;
         uint256 end;
@@ -570,33 +531,34 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         return _zeroFloorSub(area, _areaAfter(boosted, end, x, (day + 1) * DAY));
     }
 
+    /// @notice Number of days with recorded area for `user`.
     function userEpochCount(address user) external view returns (uint256) {
         return _userEpochs[user].length;
     }
 
+    /// @notice The `index`-th recorded day of `user`.
     function userEpochAt(address user, uint256 index) external view returns (uint256) {
         return _userEpochs[user][index];
     }
 
+    /// @notice Active reward tokens.
     function getRewardTokens() external view returns (address[] memory) {
         return rewardTokens;
     }
 
+    /// @notice Retired reward tokens (removed but still owed).
     function getRetiredRewardTokens() external view returns (address[] memory) {
         return _retiredRewardTokens;
     }
 
-    /// @notice Register a reward token, or reactivate a retired one.
+    /// @notice Owner: register a reward token, or reactivate a retired one.
     function addRewardToken(address token) external onlyOwner nonReentrant {
         _addRewardToken(token);
     }
 
-    /// @notice Stop paying `token` in `claimAll` and stop funding it. Allowed only once no budget is left on
-    ///         any open or future day (before the exit: today and later; after it: every day after the exit
-    ///         day, which can be released first), so every entitlement is final. If nothing is owed any more
-    ///         (notified == paid + released) the token is dropped entirely. Otherwise it is retired (at most
-    ///         MAX_RETIRED_REWARD_TOKENS at once): still claimable with `claim`/`claimTo`, still in `reserved`,
-    ///         still protected from recovery, forever (or until it is added again).
+    /// @notice Owner: stop paying and funding `token`. Only once no open or future day holds a budget. If
+    ///         anything is still owed the token is retired (still claimable with `claim`/`claimTo` and
+    ///         reserved, forever), otherwise dropped.
     function removeRewardToken(address token) external onlyOwner nonReentrant {
         if (!isRewardToken[token]) revert NotRewardToken();
         (bool scheduled,) = _scheduledDay(token, _firstUnsettledDay());
@@ -612,28 +574,28 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit RewardTokenRemoved(token, retired);
     }
 
+    /// @notice Owner: allow or revoke a reward distributor.
     function setDistributor(address distributor, bool allowed) external onlyOwner {
         if (distributor == address(0)) revert ZeroAddress();
         isDistributor[distributor] = allowed;
         emit DistributorSet(distributor, allowed);
     }
 
-    /// @notice Pauses only incoming principal. Extensions, withdrawal and claims stay open.
+    /// @notice Owner: pause new principal (lock, increase, compound). Extend, withdraw and claims stay open.
     function setLocksPaused(bool paused) external onlyOwner {
         locksPaused = paused;
         emit LocksPausedSet(paused);
     }
 
-    /// @notice Fee on `compound` only, in basis points, at most MAX_COMPOUND_FEE_BPS. Paid to the treasury.
+    /// @notice Owner: set the compound fee in bps, at most MAX_COMPOUND_FEE_BPS.
     function setCompoundFee(uint16 feeBps) external onlyOwner {
         if (feeBps > MAX_COMPOUND_FEE_BPS) revert FeeTooHigh();
         compoundFeeBps = feeBps;
         emit CompoundFeeSet(feeBps);
     }
 
-    /// @notice Step one of a treasury change: the new address may call `acceptTreasury` from
-    ///         `treasuryProposedAt + TREASURY_DELAY` (8 days) on. Every proposal, even of the same address,
-    ///         restarts the clock; zero cancels. Watch `TreasuryProposed`: there are 8 days to react.
+    /// @notice Owner: propose a new treasury, acceptable by it after TREASURY_DELAY (8 days). Each proposal
+    ///         restarts the clock; zero cancels.
     function proposeTreasury(address newTreasury) external onlyOwner {
         if (newTreasury != address(0)) _checkTreasury(newTreasury);
         pendingTreasury = newTreasury;
@@ -641,7 +603,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit TreasuryProposed(newTreasury);
     }
 
-    /// @notice Step two: the proposed treasury takes over, once TREASURY_DELAY has passed since the proposal.
+    /// @notice The proposed treasury takes over, once TREASURY_DELAY has passed since the proposal.
     function acceptTreasury() external {
         address next = pendingTreasury;
         if (msg.sender != next) revert NotPendingTreasury();
@@ -654,38 +616,31 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         treasuryProposedAt = 0;
     }
 
-    /// @notice ONE-WAY: every lock may `withdraw` now, whatever its `end`. Cannot be turned off.
-    /// @dev Moves no tokens and changes no lock or area. It lifts the time condition on `withdraw` and
-    ///      blocks what would add principal, area or budget (lock, lockFor, increaseAmount(For), compound,
-    ///      extend, funding and recycling). Rewards stop at this second: days before today stay payable by
-    ///      area; today pays its budget times the elapsed fraction of the day, split by the area each lock
-    ///      accrued before now (all of that is final: nothing can write before now); the unearned rest of
-    ///      today is released here, and later days can be released. So no locker gains by staying or
-    ///      leaving, and timing the switch only moves rewards nobody had earned yet. See docs/TECHNICAL.md.
+    /// @notice Owner, one-way: every lock may withdraw now and no new principal, extensions or funding are
+    ///         accepted. Rewards stop at this second; moves no tokens.
+    /// @dev Earlier days pay as usual. Today pays budget * elapsed / DAY, split by area accrued before now;
+    ///      the unearned rest is released here and later days can be released. See docs/TECHNICAL.md.
     function enableEmergencyExit() external onlyOwner {
         if (emergencyExit) revert EmergencyExitActive();
         uint256 x = block.timestamp;
         uint256 day = x / DAY;
-        // Exactly the area accrued before now (see `_scheduledAfter`). Saturating only so that the switch can
-        // never revert: by construction the scheduled part after now is at most the day's total.
+        // Area accrued before now. Saturating only so the switch can never revert.
         uint256 total = _zeroFloorSub(totalEpochArea[day], _scheduledAfter(x));
         emergencyExit = true;
         exitTimestamp = SafeCast.toUint64(x);
         exitDayTotalArea = total;
         uint256 elapsed = x - day * DAY;
         _scaleExitDay(rewardTokens, day, elapsed, total);
-        _scaleExitDay(_retiredRewardTokens, day, elapsed, total); // none have a budget here; kept for safety
+        _scaleExitDay(_retiredRewardTokens, day, elapsed, total);
         emit EmergencyExitEnabled(day, x, total);
     }
 
-    /// @notice Keep operational settings recoverable; transfer to a multisig/DAO instead.
+    /// @notice Disabled: ownership can be transferred but not renounced.
     function renounceOwnership() public pure override {
         revert RenounceDisabled();
     }
 
-    /// @dev Every ownership change (`acceptOwnership`; also the constructor, with nothing pending) cancels a
-    ///      pending treasury proposal, so one made by a previous owner (say, a deployer's hot key) can never
-    ///      be accepted under the new one.
+    /// @dev Every ownership change cancels a pending treasury proposal.
     function _transferOwnership(address newOwner) internal override {
         if (pendingTreasury != address(0)) {
             pendingTreasury = address(0);
@@ -695,9 +650,8 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         super._transferOwnership(newOwner);
     }
 
-    /// @notice Send an unrelated token sent here by mistake to the treasury. PULP and every token with
-    ///         reward books are refused, and no protected balance may fall below what is owed.
-    ///         Owner or treasury.
+    /// @notice Owner or treasury: send an unrelated token sent here by mistake to the treasury. PULP and
+    ///         reward tokens are refused.
     function recoverERC20(address token, uint256 amount) external onlyOwnerOrTreasury nonReentrant {
         if (token == address(pulp) || _hasBooks(token)) revert ProtectedToken();
         address to = treasury;
@@ -707,19 +661,15 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit Recovered(token, to, amount);
     }
 
-    /// @notice What the vault owes in `token`: locked PULP principal, plus every notified reward not yet
-    ///         paid (scheduled, claimable or unclaimed, including rounding dust) and not released after
-    ///         emergency exit. Never sweepable. The balance is always at least this; it is higher only by
-    ///         tokens sent in by mistake and released budgets not yet swept by `recoverExcess`.
+    /// @notice What the vault owes in `token`: locked PULP principal plus notified rewards not yet paid or
+    ///         released. Never recoverable.
     function reserved(address token) public view returns (uint256 amount) {
         if (token == address(pulp)) amount = totalLocked;
         if (_hasBooks(token)) amount += totalNotified[token] - totalPaid[token] - totalReleased[token];
     }
 
-    /// @notice Send the balance above `reserved(token)` to the treasury: PULP or reward tokens sent straight
-    ///         to the vault, released budgets, or (token = address(0)) native ETH forced into the vault.
-    ///         Owner or treasury: while a new treasury is pending, the current one can sweep what it is due
-    ///         even if the owner holds it back for the new one.
+    /// @notice Owner or treasury: send the balance above `reserved(token)` to the treasury
+    ///         (token = address(0): the native ETH balance).
     function recoverExcess(address token) external onlyOwnerOrTreasury nonReentrant returns (uint256 amount) {
         address to = treasury;
         if (token == address(0)) {
@@ -741,6 +691,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
 
     // --- Internal accounting ---
 
+    /// @dev Adds (or removes) the area of trajectory (boosted, end) from now on, per day. At most 31 days.
     function _schedulePower(address user, uint256 boosted, uint256 end, bool add) private {
         uint256 from = block.timestamp;
         uint256[] storage epochs = _userEpochs[user];
@@ -748,13 +699,12 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         while (from < end) {
             uint256 epoch = from / DAY;
             uint256 to = Math.min((epoch + 1) * DAY, end);
-            // Exactly twice the trapezoid area. Remaining time is <= 30 days.
+            // Exactly twice the trapezoid area, so no rounding.
             uint256 area = boosted * (to - from) * ((end - from) + (end - to));
             if (add) {
                 totalEpochArea[epoch] += area;
                 userEpochArea[user][epoch] += area;
-                // Position schedules are contiguous; only later epochs are appended.
-                // Existing epochs survive withdrawal, restart, and remove/re-add on extension.
+                // Schedules are contiguous; only later epochs are appended.
                 if (epochs.length == 0 || epoch > epochs[epochs.length - 1]) epochs.push(epoch);
             } else {
                 totalEpochArea[epoch] -= area;
@@ -764,10 +714,8 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         }
     }
 
-    /// @dev Every trajectory scheduled from now to `end` (added, or removed by `extend`) is also indexed by
-    ///      its end second, so the switch can find, in bounded time, how much scheduled area lies after it.
-    ///      A trajectory that reaches its end is never removed: from then on its end is in the past, and
-    ///      the switch only reads ends after itself.
+    /// @dev Indexes each scheduled trajectory by its end second, so the switch can sum the area scheduled
+    ///      after it in bounded time. Ended trajectories are never removed; the switch only reads future ends.
     function _indexEnd(uint256 boosted, uint256 end, bool add) private {
         uint256 r = end % END_BUCKET;
         uint256 rd = end % DAY;
@@ -797,11 +745,9 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         return boosted * ((end - x) * (end - x) - (end - to) * (end - to));
     }
 
-    /// @dev Sum of `_areaAfter` over every live trajectory, at the switch (`x` = now): exactly the part of
-    ///      `totalEpochArea[today]` scheduled after now. Every live trajectory started at or before now and
-    ///      ends within 30 days. Ends on later days: (dayEnd - x)(2 end - x - dayEnd) per unit of boost,
-    ///      from per-day sums (30 days). Ends later today: (end - x)^2, from 10-minute bucket sums and, for
-    ///      the bucket holding `x`, per-second sums. At most ~1,100 storage reads.
+    /// @dev Sum of `_areaAfter` over every live trajectory at `x` = now: the part of totalEpochArea[today]
+    ///      scheduled after now. Ends on later days: per-day sums (30 days). Ends later today: 10-minute
+    ///      bucket sums, plus per-second sums for the bucket holding `x`. At most ~1,100 storage reads.
     function _scheduledAfter(uint256 x) private view returns (uint256 r) {
         uint256 day = x / DAY;
         uint256 dayEnd = (day + 1) * DAY;
@@ -882,8 +828,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         if (amount != 0) IERC20(token).safeTransfer(to, amount);
     }
 
-    /// @dev Books one claim page as paid and moves the cursor. The caller delivers the tokens:
-    ///      `_claim` transfers them, `compound` turns them into principal.
+    /// @dev Books one claim page as paid and moves the cursor; the caller delivers the tokens.
     function _settle(address user, address token, uint256 maxEpochs)
         private returns (uint256 amount, uint256 nextCursor)
     {
@@ -893,7 +838,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit RewardPaid(user, token, amount, nextCursor);
     }
 
-    /// @dev Shared by `lock` and `lockFor`. PULP always comes from msg.sender, never `user`.
+    /// @dev PULP always comes from msg.sender, never `user`.
     function _lock(address user, uint256 amount, uint256 daysLocked) private {
         if (block.timestamp < launchStart) revert NotLaunched();
         if (locks[user].amount != 0) revert LockExists();
@@ -910,7 +855,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit Locked(user, amount, daysLocked, end, powerOf(user));
     }
 
-    /// @dev Shared by `increaseAmount` and `increaseAmountFor`. PULP always comes from msg.sender.
+    /// @dev PULP always comes from msg.sender, never `user`.
     function _increase(address user, uint256 amount) private {
         Lock storage l = locks[user];
         _checkTopUpWindow(l);
@@ -920,8 +865,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         _addPrincipal(user, l, amount);
     }
 
-    /// @dev The one place principal is added to an existing lock (top-ups and compounding).
-    ///      Callers check the window and capacity and account for where `amount` came from.
+    /// @dev Adds principal to an existing lock. Callers check the window and capacity.
     function _addPrincipal(address user, Lock storage l, uint256 amount) private {
         uint256 multiplier = entryMultiplier(block.timestamp);
         uint256 addedBoost = amount * multiplier;
@@ -932,8 +876,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit Increased(user, amount, multiplier, powerOf(user));
     }
 
-    /// @dev Never the vault itself (its balances are the books), the treasury or a pending treasury.
-    ///      Reactivating a retired token keeps its books: its cursors and settled day budgets carry on.
+    /// @dev Never the vault itself, the treasury or a pending treasury. Reactivation keeps the token's books.
     function _addRewardToken(address token) private {
         if (token == address(this)) revert InvalidRewardToken();
         if (token.code.length == 0) revert NotAContract();
@@ -949,7 +892,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit RewardTokenAdded(token);
     }
 
-    /// @dev Order-preserving removal from a list of at most MAX_RETIRED_REWARD_TOKENS (10).
+    /// @dev Order-preserving removal from a short list.
     function _removeFrom(address[] storage list, address token) private {
         uint256 n = list.length;
         uint256 i;
@@ -962,12 +905,9 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         return isRewardToken[token] || isRetiredRewardToken[token];
     }
 
-    /// @dev (`removeRewardToken`) First day that may still hold a budget nobody has fully earned: before the
-    ///      exit today (still open) or, before launch, the launch day; after the exit the day after the exit
-    ///      day (or the launch day).
-    ///      Every budget was scheduled by `_scheduleRewards` over the seven days from `max(t + 1, launch day)`
-    ///      for some funding/recycling day `t` (before the switch, if exited), so every budget on a day >= this
-    ///      one lies in the REWARD_DAYS + 1 days from it.
+    /// @dev First day that may still hold an unearned budget: today (after the exit: the day after the exit
+    ///      day), or the launch day if later. Every budget on or after it lies in the REWARD_DAYS + 1 days
+    ///      from it.
     function _firstUnsettledDay() private view returns (uint256) {
         return Math.max(
             emergencyExit ? uint256(exitEpoch()) + 1 : block.timestamp / DAY, Math.ceilDiv(launchStart, DAY)
@@ -981,8 +921,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         }
     }
 
-    /// @dev PULP and every token with reward books, with their balances now. A failed read is recorded as
-    ///      type(uint256).max, so `_checkReserves` holds that token to all of `reserved` (see there).
+    /// @dev PULP and every token with reward books, with their balances now (type(uint256).max if unreadable).
     function _protectedBalances() private view returns (address[] memory list, uint256[] memory balances) {
         uint256 a = rewardTokens.length;
         uint256 r = _retiredRewardTokens.length;
@@ -997,13 +936,9 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         }
     }
 
-    /// @dev After a recovery transfer, no protected balance may be below what is owed (or, if it already
-    ///      was, below what it was). Catches a token reachable at two addresses.
-    ///      Reads that fail are treated conservatively: unreadable before (an unknown balance) means the
-    ///      floor is all of `reserved`, not zero; readable before but not after (the transfer broke it) is a
-    ///      breach. Only a token unreadable both times, i.e. broken for this whole call, is skipped, so a
-    ///      broken token can't block recovering the others, and a token can't dodge the check by failing
-    ///      one of the two reads.
+    /// @dev After a recovery transfer, no protected balance may fall below min(before, reserved). Catches a
+    ///      token reachable at two addresses. Unreadable before: floor is all of `reserved`; readable before
+    ///      but not after: breach; unreadable both times: skipped.
     function _checkReserves(address[] memory list, uint256[] memory before) private view {
         for (uint256 i; i < list.length; ++i) {
             uint256 floor = Math.min(before[i], reserved(list[i]));
@@ -1012,17 +947,15 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         }
     }
 
-    /// @dev At most BALANCE_READ_GAS for the call, so a token can't consume the caller's whole gas, and a
-    ///      fixed 32-byte output buffer: whatever else the token returns is never copied into memory (a
-    ///      high-level call copies all of it, so a "return bomb" could make each read cost millions of gas).
-    ///      Succeeds only if the call succeeded and returned at least 32 bytes.
+    /// @dev Return-bomb-safe balanceOf: gas capped at BALANCE_READ_GAS and only the first 32 bytes of the
+    ///      answer are copied. Succeeds only if the call succeeded and returned at least 32 bytes.
     function _tryBalance(address token) private view returns (bool ok, uint256 value) {
         bytes4 selector = IERC20.balanceOf.selector;
         assembly ("memory-safe") {
             let ptr := mload(0x40) // calldata built past the free memory pointer, never allocated
             mstore(ptr, selector)
             mstore(add(ptr, 0x04), address())
-            // The answer goes to the scratch space at 0x00; at most its first 32 bytes are written.
+            // Answer goes to scratch space at 0x00.
             let success := staticcall(BALANCE_READ_GAS, token, ptr, 0x24, 0x00, 0x20)
             ok := and(success, gt(returndatasize(), 0x1f))
             if ok { value := mload(0x00) }
@@ -1045,10 +978,8 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         if (l.end - block.timestamp < MIN_LOCK_TIME) revert ExtendFirst();
     }
 
-    /// @dev The vault can never call withdraw, so a lock it owned would strand principal forever; tokens
-    ///      claimed to it would leave the books and become sweepable. PULP, WETH and reward tokens (active
-    ///      or retired) are token contracts that can't withdraw or move what they receive either: a
-    ///      pasted token address instead of a wallet (typo protection).
+    /// @dev Not the vault (it can never withdraw, and tokens claimed to it would become recoverable), PULP,
+    ///      WETH or a reward token (typo protection: token contracts can't move what they receive).
     function _checkBeneficiary(address beneficiary) private view {
         if (beneficiary == address(0)) revert ZeroAddress();
         if (
@@ -1057,9 +988,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         ) revert InvalidBeneficiary();
     }
 
-    /// @dev Never the vault (fees would stay in the balance but leave `reserved`), PULP, WETH or a reward
-    ///      token (active or retired): token contracts can't move what they receive (typo protection).
-    ///      WETH is refused by address too, so it stays refused even after it is removed as a reward token.
+    /// @dev Not the vault, PULP, WETH (even after removal as a reward token) or a reward token.
     function _checkTreasury(address t) private view {
         if (t == address(0)) revert ZeroAddress();
         if (t == address(this) || t == address(pulp) || t == weth || _hasBooks(t)) revert InvalidTreasury();
