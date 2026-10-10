@@ -7,7 +7,7 @@
   "scripts": {
     "build": "hardhat compile",
     "test": "hardhat test",
-    "test:vault": "hardhat test test/vault/locks.test.js test/vault/rewards.test.js test/vault/delegated.test.js test/vault/emergency.test.js test/vault/fixes.test.js test/vault/treasury.test.js test/vault/security.test.js test/vault/deploy.test.js test/vault/model.test.js",
+    "test:vault": "hardhat test test/vault/locks.test.js test/vault/rewards.test.js test/vault/delegated.test.js test/vault/emergency.test.js test/vault/fixes.test.js test/vault/treasury.test.js test/vault/audits.test.js test/vault/security.test.js test/vault/deploy.test.js test/vault/model.test.js",
     "test:zap": "hardhat test test/zap/zap.test.js test/zap/deploy.test.js",
     "test:soak": "PULP_MODEL_EXTRA_SEEDS=12 PULP_MODEL_ACTIONS=160 hardhat test test/vault/model.test.js",
     "test:fork": "FORK=1 hardhat test test/vault/fork.test.js && FORK=1 hardhat test test/zap/fork.test.js",

@@ -42,7 +42,15 @@ function random(seed) {
 // user's total entitlement (settled + still claimable) is frozen: nobody's withdrawal can move anyone
 // else's. Compounding passes a maximum fee, sometimes one below the current rate. Claims sometimes go to
 // another user with claimTo.
-const TOKENS = ['rwd', 'pulp'];
+// A third reward token ('aux') goes through the whole registry lifecycle at random: removal (dropped when nothing
+// is owed, otherwise retired), re-adding, and expiry CLAIM_DEADLINE (120 days) after retirement, which moves
+// everything still owed to the released total (sweepable) and closes its books for good. The owner also proposes
+// treasury changes at random (three candidate addresses); acceptance is predicted from the model: 8 days after
+// the proposal and after the last release, and only when no token with books has a budget on a day not yet
+// earned. Every sweep and compound fee is checked against whichever treasury was current.
+const TOKENS = ['rwd', 'pulp', 'aux'];
+const CLAIM_DEADLINE = 120n * DAY;
+const TREASURY_DELAY = 8n * DAY;
 const FEE_RATES = [0n, 1n, 37n, 100n, 200n];
 function makeModel(launch, window, users, startingPulp, feeBps) {
   const positions = users.map(() => ({ amount: 0n, boosted: 0n, end: 0n }));
@@ -61,6 +69,19 @@ function makeModel(launch, window, users, startingPulp, feeBps) {
   const exit = { on: false, epoch: 0n, ts: 0n, total: 0n };
   const released = perToken(() => 0n);
   const recovered = perToken(() => 0n);
+  // Registry lifecycle: 'active', 'retired' (removed, still owed), 'dropped' (removed, nothing owed), 'expired'.
+  const status = perToken(() => 'active');
+  const retiredAt = perToken(() => 0n);
+  const books = (token) => status[token] === 'active' || status[token] === 'retired';
+  const owed = (token) => notified[token] - paid[token] - released[token];
+  // Treasury handover state, and what each address received (compound fees and sweeps) while it was the treasury.
+  const treasury = { current: null, pending: null, proposedAt: 0n, lastReleasedAt: 0n };
+  const payouts = new Map(); // address -> { fees, rwd, pulp, aux }
+  const payee = (addr) => {
+    if (!payouts.has(addr)) payouts.set(addr, { fees: 0n, ...perToken(() => 0n) });
+    return payouts.get(addr);
+  };
+  const launchDay = (launch + DAY - 1n) / DAY;
 
   const multiplier = (t) => t <= launch ? 2n * WAD
     : t - launch >= window ? WAD
@@ -122,8 +143,17 @@ function makeModel(launch, window, users, startingPulp, feeBps) {
     return { amount, cursor, caughtUp: cursor === epochs.length || epochs[cursor] >= stop };
   }
 
-  // Settled so far plus everything still claimable on every remaining page.
-  const entitlement = (token, user, today) => credited[token][user] + quote(token, user, today, Infinity).amount;
+  // Settled so far plus everything still claimable on every remaining page (nothing once the books are closed).
+  const entitlement = (token, user, today) =>
+    credited[token][user] + (books(token) ? quote(token, user, today, Infinity).amount : 0n);
+
+  // The contract's window: the first day that may hold an unearned budget, and the 8 days from it.
+  const firstUnsettled = (today) => max(exit.on ? exit.epoch + 1n : today, launchDay);
+  function scheduledDay(token, today) {
+    const first = firstUnsettled(today);
+    for (let epoch = first; epoch <= first + 7n; epoch++) if (budget(token, epoch) !== 0n) return epoch;
+    return null;
+  }
 
   // Shared by top-ups and compounding: new principal at today's multiplier, same expiry.
   function addPrincipal(user, amount, t) {
@@ -144,7 +174,7 @@ function makeModel(launch, window, users, startingPulp, feeBps) {
 
   return {
     positions, segments, histories, cursors, received, credited, budgets, notified, paid, wallet, fee,
-    exit, released, recovered,
+    exit, released, recovered, status, retiredAt, books, owed, treasury, payouts, payee, scheduledDay,
     multiplier, area, areaBefore, totalArea, history, budget, quote, unpayable, entitlement,
     // `payer` differs from `user` for lockFor / increaseAmountFor.
     lock(user, amount, duration, t, payer = user) {
@@ -163,6 +193,7 @@ function makeModel(launch, window, users, startingPulp, feeBps) {
       const result = settle('pulp', user, today, limit);
       const charged = result.amount * fee.bps / 10_000n;
       fee.collected += charged;
+      payee(treasury.current).fees += charged;
       addPrincipal(user, result.amount - charged, t);
       return { ...result, fee: charged, net: result.amount - charged };
     },
@@ -189,6 +220,7 @@ function makeModel(launch, window, users, startingPulp, feeBps) {
       exit.epoch = dayOf(t);
       exit.ts = t;
       exit.total = users.reduce((sum, _, user) => sum + areaBefore(user, t), 0n);
+      treasury.lastReleasedAt = t;
       const original = {};
       for (const token of TOKENS) {
         const b = budget(token, exit.epoch);
@@ -199,11 +231,34 @@ function makeModel(launch, window, users, startingPulp, feeBps) {
       }
       return original;
     },
-    release(token, epoch) {
+    release(token, epoch, t) {
       const amount = budget(token, epoch);
       budgets[token].set(epoch, 0n);
       released[token] += amount;
+      if (amount !== 0n) treasury.lastReleasedAt = t;
       return amount;
+    },
+    // removeRewardToken, after the window check: retired if anything is still owed, otherwise dropped.
+    remove(token, t) {
+      status[token] = owed(token) !== 0n ? 'retired' : 'dropped';
+      retiredAt[token] = status[token] === 'retired' ? t : 0n;
+    },
+    add(token) {
+      status[token] = 'active';
+      retiredAt[token] = 0n;
+    },
+    // The claim deadline: whatever is still owed leaves the books (released), and the books close for good.
+    expire(token, t) {
+      const forfeited = owed(token);
+      released[token] += forfeited;
+      if (forfeited !== 0n) treasury.lastReleasedAt = t;
+      status[token] = 'expired';
+      retiredAt[token] = 0n;
+      return forfeited;
+    },
+    sweep(token, amount) {
+      recovered[token] += amount;
+      payee(treasury.current)[token] += amount;
     },
     notify(token, amount, t) {
       const first = max(dayOf(t) + 1n, (launch + DAY - 1n) / DAY);
@@ -235,12 +290,16 @@ describe('PulpVeVault: deterministic history-model differential', function () {
       try {
         const [owner, distributor, ...signers] = await ethers.getSigners();
         const users = signers.slice(0, 4);
-        const feeRecipient = signers[4]; // the treasury: compound fees and every sweep
+        const feeRecipient = signers[4]; // the first treasury: compound fees and every sweep
+        // Treasury candidates (the first one is the deployed treasury); none of them ever holds anything else.
+        const candidates = [feeRecipient, signers[5], signers[6]];
+        const candidateAddresses = await Promise.all(candidates.map((c) => c.getAddress()));
         const addresses = await Promise.all(users.map((u) => u.getAddress()));
         const Token = await ethers.getContractFactory('MockERC20');
         const pulp = await Token.deploy('Pulp', 'PULP', 18);
         const reward = await Token.deploy('Reward', 'RWD', 18);
-        await Promise.all([pulp.waitForDeployment(), reward.waitForDeployment()]);
+        const aux = await Token.deploy('Aux', 'AUX', 18);
+        await Promise.all([pulp.waitForDeployment(), reward.waitForDeployment(), aux.waitForDeployment()]);
 
         const block = await ethers.provider.getBlock('latest');
         const launch = (BigInt(block.timestamp) / DAY + 1n) * DAY + DAY;
@@ -255,21 +314,25 @@ describe('PulpVeVault: deterministic history-model differential', function () {
         await vault.waitForDeployment();
         await vault.connect(owner).addRewardToken(await reward.getAddress());
         await vault.connect(owner).addRewardToken(await pulp.getAddress());
+        await vault.connect(owner).addRewardToken(await aux.getAddress());
 
         const startingPulp = 1_000_000n * WAD;
         for (const user of users) {
           await pulp.mint(await user.getAddress(), startingPulp);
           await pulp.connect(user).approve(await vault.getAddress(), ethers.MaxUint256);
         }
-        for (const token of [reward, pulp]) {
+        for (const token of [reward, pulp, aux]) {
           await token.mint(await distributor.getAddress(), 1_000_000n * WAD);
           await token.connect(distributor).approve(await vault.getAddress(), ethers.MaxUint256);
         }
 
         const model = makeModel(launch, window, users, startingPulp, 150n);
+        model.treasury.current = candidateAddresses[0];
         const rewardAddress = await reward.getAddress();
         const pulpAddress = await pulp.getAddress();
-        const tokenAddress = { rwd: rewardAddress, pulp: pulpAddress };
+        const auxAddress = await aux.getAddress();
+        const tokenAddress = { rwd: rewardAddress, pulp: pulpAddress, aux: auxAddress };
+        const assetOf = { rwd: reward, pulp, aux };
         const vaultAddress = await vault.getAddress();
         let checks = 0;
         // Each user's total entitlement per token, taken at the switch.
@@ -305,16 +368,22 @@ describe('PulpVeVault: deterministic history-model differential', function () {
             expect(await vault.powerOf(addresses[user]), `user ${user} live power`).to.equal(power);
 
             for (const token of TOKENS) {
-              const quoted = model.quote(token, user, today, 64);
-              const chainQuote = await vault.claimable(addresses[user], tokenAddress[token], 64);
-              expect(chainQuote[0], `user ${user} ${token} claimable`).to.equal(quoted.amount);
-              expect(chainQuote[1], `user ${user} ${token} next cursor`).to.equal(BigInt(quoted.cursor));
-              expect(chainQuote[2], `user ${user} ${token} caught up`).to.equal(quoted.caughtUp);
+              if (model.books(token)) {
+                const quoted = model.quote(token, user, today, 64);
+                const chainQuote = await vault.claimable(addresses[user], tokenAddress[token], 64);
+                expect(chainQuote[0], `user ${user} ${token} claimable`).to.equal(quoted.amount);
+                expect(chainQuote[1], `user ${user} ${token} next cursor`).to.equal(BigInt(quoted.cursor));
+                expect(chainQuote[2], `user ${user} ${token} caught up`).to.equal(quoted.caughtUp);
+              } else if (user === 0) {
+                await expect(vault.claimable(addresses[user], tokenAddress[token], 64), `${token} has no books`)
+                  .to.be.revertedWithCustomError(vault, 'NotRewardToken');
+              }
               expect(await vault.claimCursor(addresses[user], tokenAddress[token]),
                 `user ${user} ${token} stored cursor`).to.equal(BigInt(model.cursors[token][user]));
             }
             expect(await reward.balanceOf(addresses[user]),
               `user ${user} rewards received`).to.equal(model.received.rwd[user]);
+            expect(await aux.balanceOf(addresses[user]), `user ${user} aux received`).to.equal(model.received.aux[user]);
             // Locks, top-ups (own or paid for others), withdrawals and PULP claims; never compounding.
             expect(await pulp.balanceOf(addresses[user]), `user ${user} PULP wallet`).to.equal(model.wallet[user]);
           }
@@ -328,9 +397,23 @@ describe('PulpVeVault: deterministic history-model differential', function () {
           }
           expect(await vault.totalLocked()).to.equal(locked);
           expect(await vault.compoundFeeBps(), 'fee rate').to.equal(model.fee.bps);
-          expect(await pulp.balanceOf(await feeRecipient.getAddress()), 'treasury PULP: compound fees + sweeps')
-            .to.equal(model.fee.collected + model.recovered.pulp);
-          expect(await reward.balanceOf(await feeRecipient.getAddress()), 'treasury rewards: sweeps').to.equal(model.recovered.rwd);
+          // Each treasury (current or past) holds exactly the compound fees and sweeps made while it was current.
+          for (const addr of candidateAddresses) {
+            const got = model.payee(addr);
+            expect(await pulp.balanceOf(addr), `treasury ${addr} PULP: compound fees + sweeps`).to.equal(got.fees + got.pulp);
+            expect(await reward.balanceOf(addr), `treasury ${addr} rewards: sweeps`).to.equal(got.rwd);
+            expect(await aux.balanceOf(addr), `treasury ${addr} aux: sweeps`).to.equal(got.aux);
+          }
+          expect([...model.payouts.values()].reduce((a, g) => a + g.fees, 0n), 'all compound fees').to.equal(model.fee.collected);
+          expect(await vault.treasury(), 'treasury').to.equal(model.treasury.current);
+          expect(await vault.pendingTreasury(), 'pending treasury').to.equal(model.treasury.pending ?? ethers.ZeroAddress);
+          expect(await vault.treasuryProposedAt(), 'treasury proposed at').to.equal(model.treasury.proposedAt);
+          expect(await vault.lastReleasedAt(), 'last release').to.equal(model.treasury.lastReleasedAt);
+          // The registry: aux's lifecycle state, on-chain.
+          expect([await vault.isRewardToken(auxAddress), await vault.isRetiredRewardToken(auxAddress),
+            await vault.isExpiredRewardToken(auxAddress), await vault.retiredAt(auxAddress)], 'aux registry state')
+            .to.deep.equal([model.status.aux === 'active', model.status.aux === 'retired', model.status.aux === 'expired', model.retiredAt.aux]);
+          expect(await vault.getRetiredRewardTokens(), 'retired list').to.deep.equal(model.status.aux === 'retired' ? [auxAddress] : []);
           expect(await vault.emergencyExit(), 'emergency exit flag').to.equal(model.exit.on);
           expect(await vault.exitEpoch(), 'exit day').to.equal(model.exit.epoch);
           expect(await vault.exitTimestamp(), 'exit second').to.equal(model.exit.ts);
@@ -341,6 +424,7 @@ describe('PulpVeVault: deterministic history-model differential', function () {
             }
           }
           expect(await reward.balanceOf(vaultAddress)).to.equal(held('rwd'));
+          expect(await aux.balanceOf(vaultAddress)).to.equal(held('aux'));
           for (const token of TOKENS) {
             expect(await vault.totalReleased(tokenAddress[token]), `${token} released`).to.equal(model.released[token]);
           }
@@ -350,10 +434,11 @@ describe('PulpVeVault: deterministic history-model differential', function () {
           // the sweep can only ever see released budgets nobody can earn: everything else here is owed
           expect(await vault.reserved(pulpAddress), 'reserved PULP').to.equal(locked + owed('pulp'));
           expect(await vault.reserved(rewardAddress), 'reserved rewards').to.equal(owed('rwd'));
+          expect(await vault.reserved(auxAddress), 'reserved aux').to.equal(owed('aux'));
           // The invariant: the vault always holds at least what it owes. Equal unless released budgets
           // wait to be swept (this run sends no strays).
           for (const token of TOKENS) {
-            const asset = token === 'pulp' ? pulp : reward;
+            const asset = assetOf[token];
             const balance = await asset.balanceOf(vaultAddress), owedNow = await vault.reserved(tokenAddress[token]);
             expect(balance >= owedNow, `${token} balance >= reserved`).to.equal(true);
             expect(balance - owedNow, `${token} excess is only unswept releases`)
@@ -370,6 +455,8 @@ describe('PulpVeVault: deterministic history-model differential', function () {
               const payableDays = model.history(user).filter((e) => e <= model.exit.epoch).length;
               for (const token of TOKENS) {
                 expect(model.cursors[token][user] <= payableDays, `user ${user} ${token} cursor before the exit day`).to.equal(true);
+                // An expiry after the switch forfeits what was left unclaimed: the one deliberate exception.
+                if (model.status[token] === 'expired' || !model.books(token)) continue;
                 const frozen = entitledAtExit[token][user];
                 expect(model.entitlement(token, user, today), `user ${user} ${token} entitlement frozen at the switch`).to.equal(frozen);
                 const chainQuote = await vault.claimable(addresses[user], tokenAddress[token], 64);
@@ -413,8 +500,11 @@ describe('PulpVeVault: deterministic history-model differential', function () {
                   .to.equal(amount);
               }
               const totalBudgets = [...model.budgets[token].values()].reduce((a, b) => a + b, 0n);
-              expect(totalBudgets, `${token} additive seven-day budgets`)
-                .to.equal(model.notified[token] - model.released[token]);
+              // An expired token's old budgets stay in storage, unreachable; its forfeit is in `released`.
+              if (model.status[token] !== 'expired') {
+                expect(totalBudgets, `${token} additive seven-day budgets`)
+                  .to.equal(model.notified[token] - model.released[token]);
+              }
             }
           }
           for (const epoch of epochs) if (epoch >= 0n) await checkArea(epoch);
@@ -534,7 +624,7 @@ describe('PulpVeVault: deterministic history-model differential', function () {
             const pages = [];
             for (let other = 0; other < users.length; other++) {
               if (other === user) continue;
-              for (const token of TOKENS) pages.push((await vault.claimable(addresses[other], tokenAddress[token], 64)).join());
+              for (const token of TOKENS.filter(model.books)) pages.push((await vault.claimable(addresses[other], tokenAddress[token], 64)).join());
             }
             return pages;
           };
@@ -573,12 +663,16 @@ describe('PulpVeVault: deterministic history-model differential', function () {
         // Release an unpayable day (the exit day or later, whatever its area, or zero area) if there is one;
         // otherwise show that a day before the exit day with area cannot be released.
         async function release(token) {
+          if (!model.books(token)) {
+            await expectRevert(`release ${token} (no books)`, vault.releaseEmptyRewards(tokenAddress[token], model.exit.epoch + 1n), 'NotRewardToken');
+            return;
+          }
           const days = [...model.budgets[token]].filter(([, amount]) => amount !== 0n).map(([epoch]) => epoch);
           const empty = days.filter((epoch) => model.unpayable(epoch));
           if (empty.length) {
             const epoch = empty[rand(empty.length)];
             const { returned } = await send(`release ${token} day=${epoch}`,
-              vault.releaseEmptyRewards(tokenAddress[token], epoch), () => model.release(token, epoch), [epoch]);
+              vault.releaseEmptyRewards(tokenAddress[token], epoch), (at) => model.release(token, epoch, at), [epoch]);
             expect(returned, 'released a budget').to.be.greaterThan(0n);
             await expectRevert(`release ${token} day=${epoch} again`,
               vault.releaseEmptyRewards(tokenAddress[token], epoch), 'NothingToFund');
@@ -590,6 +684,10 @@ describe('PulpVeVault: deterministic history-model differential', function () {
 
         // One call releases every budget after the exit day. They all sit in the seven days the contract scans.
         async function releasePostExit(token) {
+          if (!model.books(token)) {
+            await expectRevert(`releasePostExit ${token} (no books)`, vault.releasePostExitRewards(tokenAddress[token]), 'NotRewardToken');
+            return;
+          }
           const after = [...model.budgets[token]].filter(([epoch, amount]) => amount !== 0n && epoch > model.exit.epoch);
           const first = max(model.exit.epoch + 1n, (launch + DAY - 1n) / DAY);
           for (const [epoch] of after) {
@@ -602,22 +700,24 @@ describe('PulpVeVault: deterministic history-model differential', function () {
           const total = after.reduce((sum, [, amount]) => sum + amount, 0n);
           expect(await vault.releasePostExitRewards.staticCall(tokenAddress[token]), 'released total').to.equal(total);
           await send(`releasePostExit ${token} ${total}`, vault.releasePostExitRewards(tokenAddress[token]),
-            () => { for (const [epoch] of after) model.release(token, epoch); }, after.map(([epoch]) => epoch));
+            (at) => { for (const [epoch] of after) model.release(token, epoch, at); }, after.map(([epoch]) => epoch));
           await expectRevert(`releasePostExit ${token} again`, vault.releasePostExitRewards(tokenAddress[token]), 'NothingToFund');
         }
 
         // Only released budgets are excess; the owner's sweep takes exactly those, to the treasury only.
         async function recover(token) {
           const due = model.released[token] - model.recovered[token];
-          const asset = token === 'pulp' ? pulp : reward;
-          const to = await feeRecipient.getAddress();
+          const asset = assetOf[token];
+          const to = model.treasury.current;
           if (due === 0n) {
             await expectRevert(`recoverExcess ${token} (nothing)`, vault.connect(owner).recoverExcess(tokenAddress[token]), 'NothingToRecover');
             return;
           }
           const before = await asset.balanceOf(to);
-          await send(`recoverExcess ${token} ${due}`, vault.connect(owner).recoverExcess(tokenAddress[token]),
-            () => { model.recovered[token] += due; });
+          // The owner or the current treasury itself; either way only to the current treasury.
+          const caller = rand(2) === 0 ? owner : candidates[candidateAddresses.indexOf(to)];
+          await send(`recoverExcess ${token} ${due} by ${caller === owner ? 'owner' : 'treasury'}`,
+            vault.connect(caller).recoverExcess(tokenAddress[token]), () => model.sweep(token, due));
           expect(await asset.balanceOf(to), `${token} swept`).to.equal(before + due);
         }
 
@@ -639,6 +739,11 @@ describe('PulpVeVault: deterministic history-model differential', function () {
 
         async function notify(token) {
           const value = funding();
+          if (model.status[token] !== 'active') {
+            await expectRevert(`notify ${token} (${model.status[token]})`,
+              vault.connect(distributor).notifyRewardAmount(tokenAddress[token], value), 'NotRewardToken');
+            return;
+          }
           const { returned: first } = await send(`notify ${token} amount=${value}`,
             vault.connect(distributor).notifyRewardAmount(tokenAddress[token], value),
             (at) => model.notify(token, value, at));
@@ -650,7 +755,13 @@ describe('PulpVeVault: deterministic history-model differential', function () {
 
         // `to` !== user: claimTo, the user's own page sent to another user.
         async function claim(token, user, limit, repeatIfCaughtUp = false, to = user) {
-          const asset = token === 'pulp' ? pulp : reward;
+          const asset = assetOf[token];
+          if (!model.books(token)) {
+            await expectRevert(`claim ${token} u${user} (no books)`, to === user
+              ? vault.connect(users[user]).claim(tokenAddress[token], limit)
+              : vault.connect(users[user]).claimTo(tokenAddress[token], limit, addresses[to]), 'NotRewardToken');
+            return;
+          }
           async function once() {
             const before = await asset.balanceOf(addresses[to]);
             const { returned } = await send(`claim${to === user ? '' : `To u${to}`} ${token} u${user} limit=${limit}`,
@@ -666,6 +777,116 @@ describe('PulpVeVault: deterministic history-model differential', function () {
             expect(second.amount, 'idempotent closed-day claim').to.equal(0n);
             expect(second.cursor).to.equal(first.cursor);
           }
+        }
+
+        // --- Registry lifecycle of 'aux' (remove / re-add / expire) and treasury handovers ---
+
+        // Near midnight (before the exit) the window the contract scans can move between quote and block.
+        const nearMidnight = (t) => !model.exit.on && dayOf(t + MARGIN) !== dayOf(t);
+
+        async function removeAux() {
+          const call = () => vault.connect(owner).removeRewardToken(auxAddress);
+          if (model.status.aux !== 'active') return expectRevert(`remove aux (${model.status.aux})`, call(), 'NotRewardToken');
+          const t = await currentTime();
+          if (nearMidnight(t)) return advance(MARGIN * 2n);
+          if (model.scheduledDay('aux', dayOf(t)) !== null) return expectRevert('remove aux (scheduled)', call(), 'RewardsStillScheduled');
+          const retire = model.owed('aux') !== 0n;
+          const tx = call();
+          await send(`remove aux (${retire ? 'retired' : 'dropped'})`, tx, (at) => model.remove('aux', at));
+          await expect(tx).to.emit(vault, 'RewardTokenRemoved').withArgs(auxAddress, retire);
+        }
+
+        async function addAux() {
+          const call = () => vault.connect(owner).addRewardToken(auxAddress);
+          if (model.status.aux === 'active') return expectRevert('add aux (active)', call(), 'RewardTokenExists');
+          if (model.status.aux === 'expired') return expectRevert('add aux (expired)', call(), 'ExpiredRewardToken');
+          const owedBefore = model.owed('aux');
+          await send(`add aux (${model.status.aux})`, call(), () => model.add('aux'));
+          expect(await vault.reserved(auxAddress), 'reactivated with its books').to.equal(owedBefore);
+        }
+
+        // Permissionless: a random user closes the books.
+        async function expireAux(jump) {
+          const caller = users[rand(users.length)];
+          const call = () => vault.connect(caller).expireRewardToken(auxAddress);
+          if (model.status.aux !== 'retired') return expectRevert(`expire aux (${model.status.aux})`, call(), 'NotRetiredRewardToken');
+          const deadline = model.retiredAt.aux + CLAIM_DEADLINE;
+          let t = await currentTime();
+          if (jump && t < deadline + MARGIN) {
+            await advance(deadline + MARGIN - t + BigInt(rand(3_600)));
+            t = await currentTime();
+          }
+          if (t + MARGIN < deadline) return expectRevert('expire aux (too early)', call(), 'ClaimDeadlineNotReached');
+          if (t < deadline + MARGIN) return advance(MARGIN * 2n);
+          const forfeited = model.owed('aux');
+          const tx = call();
+          await send(`expire aux forfeited=${forfeited}`, tx, (at) => model.expire('aux', at));
+          await expect(tx).to.emit(vault, 'RewardTokenExpired').withArgs(auxAddress, forfeited);
+        }
+
+        // Mostly the step that can succeed in the current state; sometimes one that must be refused.
+        async function auxLifecycle() {
+          const r = rand(20);
+          const state = model.status.aux;
+          if (state === 'active') {
+            if (r < 16) await removeAux();
+            else if (r < 18) await addAux();
+            else await expireAux(false);
+          } else if (state === 'retired') {
+            if (r < 7) await addAux();
+            else if (r < 13) await expireAux(false);
+            else if (r < 17) await expireAux(true);
+            else await removeAux();
+          } else if (state === 'dropped') {
+            if (r < 14) await addAux();
+            else if (r < 17) await expireAux(false);
+            else await removeAux();
+          } else if (r < 7) await addAux();
+          else if (r < 14) await expireAux(false);
+          else await removeAux();
+        }
+
+        async function proposeTreasury() {
+          const cancel = rand(6) === 0;
+          const next = cancel ? ethers.ZeroAddress : candidateAddresses[rand(candidateAddresses.length)];
+          await send(`proposeTreasury ${cancel ? '(cancel)' : next}`, vault.connect(owner).proposeTreasury(next), (at) => {
+            model.treasury.pending = cancel ? null : next;
+            model.treasury.proposedAt = cancel ? 0n : at;
+          });
+        }
+
+        async function acceptTreasury() {
+          const T = model.treasury;
+          if (T.pending === null) {
+            const who = candidates[rand(candidates.length)];
+            return expectRevert('acceptTreasury (nothing pending)', vault.connect(who).acceptTreasury(), 'NotPendingTreasury');
+          }
+          const signer = candidates[candidateAddresses.indexOf(T.pending)];
+          const call = () => vault.connect(signer).acceptTreasury();
+          const t = await currentTime();
+          const acceptableAt = max(T.proposedAt, T.lastReleasedAt) + TREASURY_DELAY;
+          if (t + MARGIN < acceptableAt) {
+            if (rand(2) === 0) return expectRevert('acceptTreasury (delay)', call(), 'TreasuryDelayNotOver');
+            return advance(acceptableAt + MARGIN - t + BigInt(rand(3 * 86_400))); // wait it out, then try again later
+          }
+          if (t < acceptableAt + MARGIN || nearMidnight(t)) return advance(MARGIN * 2n);
+          // Active tokens first, then retired ones: the order the contract scans.
+          const order = TOKENS.filter((k) => model.status[k] === 'active').concat(TOKENS.filter((k) => model.status[k] === 'retired'));
+          const blocking = order.map((k) => model.scheduledDay(k, dayOf(t))).find((d) => d !== null);
+          if (blocking !== undefined) return expectRevert(`acceptTreasury (day ${blocking} not earned)`, call(), 'UnearnedRewardsScheduled');
+          const previous = T.current;
+          const tx = call();
+          await send(`acceptTreasury ${T.pending}`, tx, () => {
+            T.current = T.pending;
+            T.pending = null;
+            T.proposedAt = 0n;
+          });
+          await expect(tx).to.emit(vault, 'TreasuryChanged').withArgs(previous, model.treasury.current);
+        }
+
+        async function treasuryAction() {
+          if (model.treasury.pending === null || rand(8) === 0) await proposeTreasury();
+          else await acceptTreasury();
         }
 
         await network.provider.send('evm_setNextBlockTimestamp', [Number(launch)]);
@@ -710,20 +931,22 @@ describe('PulpVeVault: deterministic history-model differential', function () {
             await enableExit();
           }
           if (model.exit.on) {
-            const options = ['claim', 'advance', 'release', 'releasePostExit', 'recover', 'blocked', 'setFee'];
+            const options = ['claim', 'advance', 'release', 'releasePostExit', 'recover', 'blocked', 'setFee', 'aux', 'aux', 'treasury', 'treasury'];
             if (position.amount !== 0n) options.push('withdraw', 'withdraw', 'withdraw');
             const chosen = options[rand(options.length)];
             if (chosen === 'withdraw') await withdraw(user);
-            else if (chosen === 'claim') await claim(TOKENS[rand(2)], user, [1, 3, 64][rand(3)], true, rand(4) === 0 ? rand(users.length) : user);
-            else if (chosen === 'release') await release(TOKENS[rand(2)]);
-            else if (chosen === 'releasePostExit') await releasePostExit(TOKENS[rand(2)]);
-            else if (chosen === 'recover') await recover(TOKENS[rand(2)]);
+            else if (chosen === 'claim') await claim(TOKENS[rand(3)], user, [1, 3, 64][rand(3)], true, rand(4) === 0 ? rand(users.length) : user);
+            else if (chosen === 'release') await release(TOKENS[rand(3)]);
+            else if (chosen === 'releasePostExit') await releasePostExit(TOKENS[rand(3)]);
+            else if (chosen === 'recover') await recover(TOKENS[rand(3)]);
             else if (chosen === 'blocked') await blocked(user);
             else if (chosen === 'setFee') await setFee();
+            else if (chosen === 'aux') await auxLifecycle();
+            else if (chosen === 'treasury') await treasuryAction();
             else await advance((1n + BigInt(rand(4))) * DAY + BigInt(rand(7_200)));
             continue;
           }
-          const options = ['notify', 'claim', 'advance', 'compound', 'setFee'];
+          const options = ['notify', 'claim', 'advance', 'compound', 'setFee', 'aux', 'aux', 'treasury', 'treasury', 'recover'];
           if (position.amount === 0n) options.push('lock', 'lock', 'lockFor');
           else {
             options.push('extend', 'extend');
@@ -745,8 +968,11 @@ describe('PulpVeVault: deterministic history-model differential', function () {
             else await advance((1n + BigInt(rand(4))) * DAY + BigInt(rand(7_200)));
           } else if (chosen === 'withdraw') await withdraw(user);
           else if (chosen === 'setFee') await setFee();
-          else if (chosen === 'notify') await notify(TOKENS[rand(2)]);
-          else if (chosen === 'claim') await claim(TOKENS[rand(2)], user, [1, 3, 64][rand(3)], true, rand(4) === 0 ? rand(users.length) : user);
+          else if (chosen === 'notify') await notify(TOKENS[rand(3)]);
+          else if (chosen === 'claim') await claim(TOKENS[rand(3)], user, [1, 3, 64][rand(3)], true, rand(4) === 0 ? rand(users.length) : user);
+          else if (chosen === 'aux') await auxLifecycle();
+          else if (chosen === 'treasury') await treasuryAction();
+          else if (chosen === 'recover') await recover(TOKENS[rand(3)]);
           else await advance((1n + BigInt(rand(4))) * DAY + BigInt(rand(7_200)));
         }
 
@@ -759,15 +985,15 @@ describe('PulpVeVault: deterministic history-model differential', function () {
         await advance(31n * DAY);
         for (const token of TOKENS) {
           for (const [epoch, amount] of [...model.budgets[token]]) {
-            if (amount !== 0n && model.unpayable(epoch)) {
+            if (model.books(token) && amount !== 0n && model.unpayable(epoch)) {
               await send(`release ${token} day=${epoch}`, vault.releaseEmptyRewards(tokenAddress[token], epoch),
-                () => model.release(token, epoch), [epoch]);
+                (at) => model.release(token, epoch, at), [epoch]);
             }
           }
           await recover(token);
         }
         for (let user = 0; user < users.length; user++) {
-          for (const token of TOKENS) {
+          for (const token of TOKENS.filter(model.books)) {
             while (!model.quote(token, user, dayOf(await currentTime()), 64).caughtUp) await claim(token, user, 64);
             await claim(token, user, 64, true);
           }
@@ -779,12 +1005,32 @@ describe('PulpVeVault: deterministic history-model differential', function () {
             if (epoch > model.exit.epoch) expect(amount, `${token} day ${epoch} after the exit day`).to.equal(0n);
           }
           for (let user = 0; user < users.length; user++) {
-            expect(model.credited[token][user], `u${user} ${token} paid exactly the frozen entitlement`).to.equal(entitledAtExit[token][user]);
+            if (model.status[token] === 'expired') {
+              expect(model.credited[token][user] <= entitledAtExit[token][user], `u${user} ${token} paid within the frozen entitlement`).to.equal(true);
+            } else {
+              expect(model.credited[token][user], `u${user} ${token} paid exactly the frozen entitlement`).to.equal(entitledAtExit[token][user]);
+            }
           }
-          const asset = token === 'pulp' ? pulp : reward;
+          const asset = assetOf[token];
           expect(await asset.balanceOf(vaultAddress), `${token} only dust left`).to.equal(await vault.reserved(tokenAddress[token]));
         }
+        // Finally close aux's books for good: retire it (if it still has books), wait out the claim deadline,
+        // expire it and sweep the forfeit. Whatever happened to it during the run, nothing is left behind.
+        if (model.status.aux === 'active') await removeAux();
+        if (model.status.aux === 'retired') {
+          await expireAux(true);
+          while (model.status.aux === 'retired') await expireAux(false);
+          await recover('aux');
+        }
+        await checkState(true);
+        expect(await aux.balanceOf(vaultAddress), 'aux: nothing left').to.equal(await vault.reserved(auxAddress));
         expect(checks).to.be.greaterThan(80);
+        const count = (re) => trace.filter((line) => re.test(line)).length;
+        console.log(`      seed 0x${seed.toString(16)}: aux retired ${count(/ remove aux \(retired\)$/)},` +
+          ` dropped ${count(/ remove aux \(dropped\)$/)}, re-added ${count(/ add aux \((retired|dropped)\)$/)},` +
+          ` expired ${count(/ expire aux forfeited/)}, refused ${count(/(remove|add|expire) aux .*reverted/)};` +
+          ` treasury accepted ${count(/ acceptTreasury 0x/)}, refused ${count(/acceptTreasury .*reverted/)}` +
+          ` (${count(/not earned\) reverted/)} unearned); ${trace.length} steps`);
       } catch (error) {
         throw new Error(`Seed 0x${seed.toString(16)} failed. Exact action trace:\n${trace.join('\n')}\n${error.stack || error}`);
       }

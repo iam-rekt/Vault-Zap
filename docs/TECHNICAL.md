@@ -4,10 +4,11 @@ Design notes for `contracts/PulpVeVault.sol`: the reward model, daily settlement
 compounding, the emergency exit, the withdrawal guarantee, roles and limits. The plain-language overview is in the
 [README](../README.md); the zap that buys and locks in one transaction is in [ZAP.md](ZAP.md).
 
-Finding IDs (M-A, EF-1, AC-2, L-1, I-1, ...) refer to the internal reviews and the 2026-10-10 audit
-summarised in [SECURITY.md](SECURITY.md).
+Finding IDs (M-A, EF-1, AC-2, L-1, I-1, ...) refer to the internal reviews and the 2026-10-10 audit, and
+A1-n / A2-n to the two external audits; all are summarised in [SECURITY.md](SECURITY.md).
 
-**Status: not deployed, not externally audited.**
+**Status: not deployed.** Two external audits reviewed the previous vault source; the fixes made after them
+(treasury handover, claim deadline, typo protection) have not been externally reviewed yet.
 
 ## The model
 
@@ -86,8 +87,8 @@ No hook modification is required. The hook/pool is not called by this contract.
 | `withdraw()` | Return all principal after expiry (or at any time once the emergency exit is on); leave reward history intact |
 | `powerOf(user)` | Current decaying reward power in PULP base units |
 | `claimable(user, token, maxEpochs)` | Final amount for the next page (closed days; after the exit also the exit day up to the switch), next cursor, whether caught up |
-| `claim(token, maxEpochs)` | Claim a bounded page for one token (active or retired) |
-| `claimTo(token, maxEpochs, to)` | Claim the caller's own page and send it to `to` (not zero, not the vault); logs `RewardSentTo` |
+| `claim(token, maxEpochs)` | Claim a bounded page for one token (active, or retired until its claim deadline) |
+| `claimTo(token, maxEpochs, to)` | Claim the caller's own page and send it to `to` (not zero, the vault, PULP, WETH or any reward token); logs `RewardSentTo` |
 | `claimAll(maxEpochs)` / `claimAllTo(maxEpochs, to)` | Claim a page for each active reward token (retired ones are skipped) |
 | `userEpochCount/At(user, ...)` | Enumerate a user's recorded reward days |
 | `notifyRewardETH()` | Wrap and schedule native funding |
@@ -99,10 +100,11 @@ No hook modification is required. The hook/pool is not called by this contract.
 | `emergencyExit()`, `exitTimestamp()`, `exitEpoch()` | The switch; the second it was turned on; its UTC day (`exitTimestamp / 86400`; both 0 while off), the last day that pays |
 | `exitDayTotalArea()`, `exitDayArea(user)` | Area accrued on the exit day before the switch, in total and per user (the exit day's split) |
 | `totalReleased(token)` | Budgets released after the switch |
-| `treasury()`, `pendingTreasury()`, `treasuryProposedAt()`, `TREASURY_DELAY()`, `proposeTreasury(addr)`, `acceptTreasury()` | Where the compound fee and every recovery go; two-step change: the owner proposes, the new address accepts no sooner than `treasuryProposedAt + TREASURY_DELAY` (8 days); a new proposal restarts the clock, zero cancels, an ownership change cancels |
+| `treasury()`, `pendingTreasury()`, `treasuryProposedAt()`, `lastReleasedAt()`, `TREASURY_DELAY()`, `proposeTreasury(addr)`, `acceptTreasury()` | Where the compound fee and every recovery go; two-step change: the owner proposes, the new address accepts no sooner than `max(treasuryProposedAt, lastReleasedAt) + TREASURY_DELAY` (8 days) and only once every funded reward has been earned (`UnearnedRewardsScheduled(token, day)` otherwise); a new proposal restarts the clock, zero cancels, an ownership change cancels |
 | `recoverERC20(token, amount)`, `recoverExcess(token)` | Owner or treasury: send an unrelated token, or the balance above `reserved` (`address(0)`: native ETH), to the treasury |
 | `addRewardToken(token)`, `removeRewardToken(token)` | Owner: register (or reactivate) a reward token; stop paying one in `claimAll` once nothing is scheduled for it |
-| `getRewardTokens()`, `getRetiredRewardTokens()` | Active reward tokens; removed tokens that are still owed |
+| `expireRewardToken(token)` | Anyone, `CLAIM_DEADLINE` (120 days) after a token was retired: what is still unclaimed leaves the books (sweepable to the treasury); the token can never be added again |
+| `getRewardTokens()`, `getRetiredRewardTokens()`, `retiredAt(token)`, `isExpiredRewardToken(token)` | Active reward tokens (at most 5); removed tokens that are still owed (at most 10) and when each was retired; expired tokens |
 
 Use `maxEpochs = 64` normally. Repeat claims if `caughtUp` is false. Each token has an independent cursor. If one reward token refuses a transfer, claim other tokens individually instead of using `claimAll`, or send that token's page elsewhere with `claimTo`; if it is broken for good, the owner can remove it from `claimAll` (below). There is no need for a global keeper/checkpoint to withdraw.
 
@@ -111,9 +113,39 @@ Use `maxEpochs = 64` normally. Repeat claims if `caughtUp` is false. Each token 
 `removeRewardToken(token)` (owner) takes an active token out of `getRewardTokens()`, so `claimAll`/`claimAllTo` skip it (audit AC-2/DOS-2: one broken token made `claimAll` revert for everyone) and a slot frees up. It is allowed only when no budget is left on any open or future day: before the exit, today and later; after it, every day after the exit day (release those first). It checks the eight days from that first day (or the launch day, if later), which hold every budget that can exist on them (funding reaches today + 7). So when a token is removed every entitlement is already final.
 
 - If nothing is owed any more (`totalNotified == totalPaid + totalReleased`: every unit paid or released, no dust, nothing claimable), the token is dropped entirely: no books, recoverable like any stray token. Re-adding it later starts again from those totals; a stale cursor only walks days whose shares were all zero, because a positive unclaimed share would have made the totals differ.
-- Otherwise it is **retired** (`isRetiredRewardToken`, `getRetiredRewardTokens()`; at most five): `claim`/`claimTo`/`claimable` still pay every entitlement, `reserved` still counts it, `recoverERC20` still refuses it and `recoverExcess` stops at `reserved`, and releases after the exit still work. It can't be funded (`notifyRewardAmount`, or for WETH `notifyRewardETH` and plain ETH, revert `NotRewardToken`), recycled or compounded. `addRewardToken` reactivates it with its books.
+- Otherwise it is **retired** (`isRetiredRewardToken`, `getRetiredRewardTokens()`, `retiredAt(token)`; at most ten, `MAX_RETIRED_REWARD_TOKENS`): `claim`/`claimTo`/`claimable` still pay every entitlement, `reserved` still counts it, `recoverERC20` still refuses it and `recoverExcess` stops at `reserved`, and releases after the exit still work. It can't be funded (`notifyRewardAmount`, or for WETH `notifyRewardETH` and plain ETH, revert `NotRewardToken`), recycled or compounded. `addRewardToken` reactivates it with its books (and clears `retiredAt`) while it is not expired.
 - PULP as a reward token follows the same rule; `reserved(pulp)` always includes locked principal whatever its reward status.
 - Event: `RewardTokenRemoved(token, retired)`.
+
+### Claim deadline: expiring a retired token (external audits A1-1, A2-4)
+
+A retired token used to stay retired forever: rounding dust (each day's payouts round down), rewards nobody claims
+and budgets of closed days nobody had power on (which only an active token can recycle, and only the exit can
+release) keep `totalNotified != totalPaid + totalReleased`. With five active and five retired slots both lists
+could fill up for good: retiring needs a retired slot, reactivating an active one (A1-1), and the stuck zero-power
+budgets of a retired token could never leave (A2-4).
+
+- **Users must claim a retired token within `CLAIM_DEADLINE` = 120 days after it was retired**
+  (`retiredAt(token) + CLAIM_DEADLINE`; the `RewardTokenRemoved(token, true)` event starts the clock). Before the exit
+  a token can only be retired once all its funded days are over, so every entitlement is final for the whole 120
+  days. After an emergency exit the owner can retire every token as soon as the days after the exit day are
+  released, so the deadline can start right after the exit. An active token never expires.
+- From then on anyone may call `expireRewardToken(token)` (permissionless: it only applies a published deadline,
+  and frees a retired slot). Everything still owed, `notified − paid − released` (unclaimed rewards, dust, zero-power
+  budgets), is added to `totalReleased`, so it leaves `reserved` and `recoverExcess` sweeps it to the treasury.
+  `RewardTokenExpired(token, forfeited)` is logged and `lastReleasedAt` moves (see the treasury below).
+- The token leaves the retired list and has no books: `claim`, `claimTo` and `claimable` revert `NotRewardToken`,
+  `recoverERC20` no longer refuses it, and it is not in the recovery reserve check.
+- **An expired token can never be added again** (`ExpiredRewardToken`). Its old `epochRewards` and users' cursors
+  stay in storage (clearing them would be unbounded) but nothing can read them as an entitlement any more, so no
+  old day can pay twice and the counters stay consistent (`totalNotified == totalPaid + totalReleased` from the
+  expiry on). Expiring WETH ends native funding for good, and expiring PULP ends `compound` for good: retire them
+  only when that is meant, or reactivate them within the 120 days.
+- A dropped token (nothing owed at removal) is not expired and can be re-added, as before.
+- Bounds: at most 5 active and 10 retired tokens. The loops over them: `_protectedBalances`/`_checkReserves`
+  (1 + 15 capped balance reads, twice), `_scaleExitDay` (15 reads at the switch), `acceptTreasury` (15 × 8 budget
+  reads), `_removeFrom` (≤ 10). Measured with every slot full: `recoverExcess` ~392k gas, `acceptTreasury` ~374k;
+  worst case with hostile tokens that eat their whole 100k read cap: about 3.2M for a recovery.
 
 ## Delegated deposits and compounding
 
@@ -148,7 +180,11 @@ It is a **convenience fee** (audit MS-2): `claim(pulp, n)` followed by `increase
 
 **Paging.** One call settles one page. A page that pays zero (for example days before PULP was first funded) reverts, and `claim(pulp, n)` pages past it, paying zero. Repeat `compound` while `claimable(user, pulp, n)` is non-zero. Below 10 days left, extend first or claim the tokens; after expiry, `extend` restarts the lock and compounding works again. Rewards are never lost by a failed compound.
 
-**Pause.** `lockFor`, `increaseAmountFor` and `compound` add principal, so they stop while locks are paused. `claim` stays open, so paused PULP rewards can still be taken as tokens.
+**Pause.** `lockFor`, `increaseAmountFor` and `compound` add principal, so they stop while locks are paused. `claim` stays open, so paused PULP rewards can still be taken as tokens. **The pause does not cover `extend`** (intentional): extending adds no principal, and blocking it would only force lockers to restart at a lower multiplier after expiry; extending is blocked only by the emergency exit.
+
+**Beneficiary typo protection (external audits A2-3, A2-6).** `lockFor`, `increaseAmountFor`, `claimTo` and `claimAllTo` refuse zero (`ZeroAddress`) and, with `InvalidBeneficiary`, the vault, PULP, WETH and every token with reward books (active or retired) or expired: these are token contracts that can never withdraw a lock or move what they receive, so such an address is always a pasted token address instead of a wallet. `addRewardToken` refuses the vault itself (`InvalidRewardToken`), the treasury and a pending treasury (`InvalidTreasury`) and an expired token. Other protocol contracts (the zap, the PoolManager, the hook) are not known to the vault; the zap refuses them as beneficiaries itself.
+
+**`RewardPaid` may log 0.** Every settled page emits `RewardPaid(user, token, amount, nextCursor)`, including pages that pay nothing (days before a token was funded, zero shares): the cursor still moves. Indexers should not treat it as a transfer.
 
 **Reentrancy.** All three are `nonReentrant`. `lockFor`/`increaseAmountFor` write state only after the exact-balance pull, as `lock` did; `compound`'s only external call is the fee transfer, made after every state change.
 
@@ -211,9 +247,9 @@ Tested against independent integrals of each lock's segments (restarts, mid-day 
 
 Permissionless `releasePostExitRewards(token)` does the same for every funded day after `E` in one call and returns the total (`NothingToFund` if none is left). It scans the **seven** days from `max(E + 1, launch day)`: each budget was scheduled before the switch, on some day `t ≤ E`, over the seven days from `max(t + 1, launch day)`, so every budget after `E` lies in that window. About 73k–87k gas.
 
-**Accounting.** `reserved(token) = totalLocked (PULP only) + totalNotified − totalPaid − totalReleased`. A day's budget is either payable (before `E` with area; the earned part of `E`) or releasable (after `E`, the unearned part of `E`, zero-area days), never both, and is zeroed or reduced when released, so nothing is paid or released twice. `reserved` stays exactly what is owed, including rounding dust (never released). The vault always holds at least `reserved`; more only when tokens were sent in by mistake or released days haven't been swept yet.
+**Accounting.** `reserved(token) = totalLocked (PULP only) + totalNotified − totalPaid − totalReleased`. A day's budget is either payable (before `E` with area; the earned part of `E`) or releasable (after `E`, the unearned part of `E`, zero-area days), never both, and is zeroed or reduced when released, so nothing is paid or released twice. `reserved` stays exactly what is owed, including rounding dust (released only when a retired token expires, see the claim deadline). The vault always holds at least `reserved`; more only when tokens were sent in by mistake or released days haven't been swept yet.
 
-**Where released budgets go.** Only to the treasury: they leave `reserved`, and `recoverExcess(token)` sends the balance above `reserved` to `treasury`, nowhere else (audit M-A). The treasury is fixed at deploy and changes only two-step, 8 days after a proposal at the earliest (see Roles); the current treasury can sweep released budgets itself during those 8 days. Rejected alternatives: the distributor (several may exist and the vault doesn't record who funded which day); whoever stays (review M-2: a tiny lock could collect what leavers forfeit); the exit day by full-day power (review N-1: a stayer would earn until 24:00 while leavers stop at their exit); nothing for the exit day (review N-1 fix, audit M-A: the owner chose how much of an earned day lockers lost).
+**Where released budgets go.** Only to the treasury: they leave `reserved`, and `recoverExcess(token)` sends the balance above `reserved` to `treasury`, nowhere else (audit M-A). The treasury is fixed at deploy and changes only two-step, 8 days after the proposal and after the last release at the earliest, and only once every funded budget has been earned (see Roles); the current treasury can sweep released budgets itself during those 8 days. Rejected alternatives: the distributor (several may exist and the vault doesn't record who funded which day); whoever stays (review M-2: a tiny lock could collect what leavers forfeit); the exit day by full-day power (review N-1: a stayer would earn until 24:00 while leavers stop at their exit); nothing for the exit day (review N-1 fix, audit M-A: the owner chose how much of an earned day lockers lost).
 
 **Trade-offs and what the switch can and cannot do.**
 
@@ -241,16 +277,20 @@ This is a **contract-level** guarantee (audit DOS-6): `withdraw()` succeeds and 
 
 ## Roles, asset assumptions and limits
 
-- **Owner** (meant to be a multisig): two-step ownership transfer, up to five active reward tokens and their removal (`removeRewardToken`, only once nothing is scheduled; earned rewards stay claimable), distributor permissions, pause/unpause incoming principal, the compound fee rate (0–2%, hard-capped, and never above the maximum each caller passes), proposing a treasury, recovering strays to the treasury (`recoverERC20` for unrelated tokens; `recoverExcess` for the balance above `reserved(token)` of PULP, reward tokens and, with `address(0)`, native ETH forced into the vault by `selfdestruct` or similar), and the one-way emergency exit.
+- **Owner** (meant to be a multisig): two-step ownership transfer, up to five active reward tokens and their removal (`removeRewardToken`, only once nothing is scheduled; earned rewards stay claimable for 120 days, then the token can be expired by anyone), distributor permissions, pause/unpause incoming principal, the compound fee rate (0–2%, hard-capped, and never above the maximum each caller passes), proposing a treasury, recovering strays to the treasury (`recoverERC20` for unrelated tokens; `recoverExcess` for the balance above `reserved(token)` of PULP, reward tokens and, with `address(0)`, native ETH forced into the vault by `selfdestruct` or similar), and the one-way emergency exit.
 - Owner cannot touch locked PULP or owed rewards (`recoverExcess` stops at `reserved`), cannot send anything to any address but the treasury, cannot sweep PULP or reward tokens with `recoverERC20`, edit the immutable launch/duration model, pause or delay withdrawals/claims/extensions, turn the emergency exit off, or upgrade this contract.
 - **Recovery checks (audit EF-1, re-review I-3).** `recoverERC20` refuses PULP and every token with reward books by address, and after every recovery transfer both recover functions check that no protected balance (PULP, every active and retired reward token) is below `min(its balance before, reserved(token))`, else `ReserveBreached(token)`. A token reachable at a second address can't be used to move owed rewards or principal. The `min` keeps recovery usable if a protected token is already short, for example after a WETH gateway burn, while still forbidding any further drop. Each `balanceOf` read gets at most 100k gas (`BALANCE_READ_GAS`), so a token can't burn the caller's whole gas limit. Failed reads are treated conservatively: unreadable **before** the transfer means its balance is unknown, so the floor is all of `reserved(token)` instead of zero (otherwise a token whose `balanceOf` fails and whose second address repairs it during the drain would pass with a zero floor); readable before but **not after** counts as a breach (the transfer broke it). Only a token unreadable both times, broken for the whole call, is skipped, so a broken token still can't block recovering the others. The cost of that choice: a token that fails only the first read and is already short of `reserved` blocks recoveries until its reads work again (retry later). Residual: a protected token that is broken for the whole call *and* has a second working entry point is not checked; reward tokens must not have either property (below).
-- **Treasury.** Receives the compound fee and every recovery. `Config.treasury` at deploy; afterwards `proposeTreasury(addr)` (owner) then `acceptTreasury()` from `addr` itself, no sooner than `treasuryProposedAt() + TREASURY_DELAY` (8 days; else `TreasuryDelayNotOver(acceptableAt)`). Events `TreasuryProposed(addr)`, `TreasuryChanged(old, new)`. Every proposal restarts the clock, even of the same address; `proposeTreasury(address(0))` cancels (pending and time cleared). Never zero, the vault, PULP or a token with reward books (`InvalidTreasury`, checked at deploy, proposal and acceptance); `addRewardToken` refuses the current or pending treasury.
+- **Treasury.** Receives the compound fee and every recovery. `Config.treasury` at deploy; afterwards `proposeTreasury(addr)` (owner) then `acceptTreasury()` from `addr` itself, no sooner than `max(treasuryProposedAt(), lastReleasedAt()) + TREASURY_DELAY` (8 days; else `TreasuryDelayNotOver(acceptableAt)`), and only while no token with reward books (active or retired) has a budget on a day not yet earned (else `UnearnedRewardsScheduled(token, day)`, the first such day). Events `TreasuryProposed(addr)`, `TreasuryChanged(old, new)`. Every proposal restarts the clock, even of the same address; `proposeTreasury(address(0))` cancels (pending and time cleared). Never zero, the vault, PULP or a token with reward books (`InvalidTreasury`, checked at deploy, proposal and acceptance); `addRewardToken` refuses the current or pending treasury.
   - **Ownership changes cancel a pending proposal (re-review L-1).** `_transferOwnership` is overridden: when ownership actually changes (`acceptOwnership`), a pending proposal is cleared and `TreasuryProposed(address(0))` is logged. So a treasury proposed by the deployer's hot key before the handover (or by any previous owner) can never be accepted under the new owner. Offering ownership (`transferOwnership`) alone clears nothing: the offering owner is still the owner and could propose again anyway.
-  - **The delay (re-review L-2).** Without it a stolen owner key could propose its own address, accept, turn on the emergency exit, release the unearned days and sweep them, in consecutive transactions. 8 days is at least the release window: funding on day `p` reaches day `p + 7` at most, and a proposal at any second of day `p` becomes acceptable at the earliest at `(p + 8) · DAY`, after every day funded before the proposal has closed. **The community has 8 days to react to `TreasuryProposed`:** the distributor stops funding (so nothing new is unearned at acceptance), lockers keep everything earned in any case, and the current treasury sweeps whatever the owner releases.
+  - **The delay (re-review L-2).** Without it a stolen owner key could propose its own address, accept, turn on the emergency exit, release the unearned days and sweep them, in consecutive transactions. **The community has 8 days to react to `TreasuryProposed`.**
+  - **Acceptance waits until every funded reward is earned (external audit A1-2).** The delay alone did not protect funded but unearned rewards. The old reasoning ("funding reaches at most today + 7, so after 8 days everything funded before the proposal is earned") is false: funding before launch sits on the 7 days from the launch day, possibly far ahead, and recycling re-schedules a closed empty day onto the next 7 days. A compromised owner could propose, wait 8 days, accept, exit, release and sweep those budgets to its own treasury, and the old treasury could not help: nothing is released until the exit, which only the owner can trigger. Now `acceptTreasury` scans every token with books over the window `removeRewardToken` uses: the 8 days from `max(today, launch day)` before the exit, from `max(exit day + 1, launch day)` after it. Every budget that can still exist on a day not yet earned lies in that window (each was scheduled over the 7 days from `max(t + 1, launch day)` for a funding or recycling day `t`; after the exit, days after the exit day are never earned until they are released). At most 15 tokens × 8 reads (~374k gas with every slot full). And because releasing is the other way funds leave the books, acceptance also waits 8 days after the last release (`lastReleasedAt`: the switch, any release, an expiry that forfeits something), so the current treasury always has 8 days to sweep what was released before a new one could. Without this a compromised owner could exit, release and accept in one block.
+    - **Result:** a new treasury never receives rewards funded before it was accepted: they were earned by lockers first, or released at least 8 days before the acceptance, which the current treasury can sweep (`recoverExcess` is owner-or-treasury). "The current treasury can sweep during the window" therefore applies only to funds already released; the protection for everything still scheduled is that acceptance waits until it is earned.
+    - **Procedure:** when a treasury change is proposed, the distributor stops funding (revoke it with `setDistributor(distributor, false)` if needed); acceptance becomes possible once everything funded is earned: at the end of the 7th day after the last funding, and with funding before launch at launch + 7 days. Funding during the window simply postpones acceptance.
+    - **Residuals (accepted):** budgets of closed days on which no lock had any power are earned by nobody; before the exit anyone can recycle them during the window (they then block acceptance until earned), otherwise they can reach whichever treasury is current when they are released after an exit. Unclaimed rewards whose 120-day claim deadline ends after the change go to the treasury of that time. Strays sent to the vault are not rewards.
   - **Recoveries while a proposal is pending: not blocked, and the treasury may trigger them (decision).** While a change is pending, `recoverExcess`/`recoverERC20` keep paying the current treasury, the one already accepted, so they can't benefit the proposed address. Blocking them would freeze exactly the sweep that must happen during the window. The real gap was that only the owner could sweep: a compromised owner could exit and release during the window, hold the sweep back, and run it once its own treasury took over. So both recover functions accept the owner **or the current treasury** (`onlyOwnerOrTreasury`, reverting `OwnableUnauthorizedAccount` for anyone else); the destination is still only the treasury and the amounts and checks are unchanged. Not opened to everyone: `recoverExcess` accepts any token address, and a permissionless call would let anyone make the vault call arbitrary contracts and log spoofed `Recovered` events. Trade-off: a compromised treasury can pull strays and released budgets itself, even while the owner is replacing it (before, the owner could hold them back); it already received every recovery, and principal and owed rewards stay out of reach.
 - Ownership renunciation is disabled to avoid permanently freezing pause/distributor settings. Use two-step transfer to the intended multisig/DAO instead. This does not give the owner an upgrade or protected-fund withdrawal power.
 - **Distributor** controls **whether, when and how much** to fund. Locking is a commitment, not a guarantee of fees. Future schedules do not stop new eligible lockers from competing for them.
-- **Reward tokens** must be plain ERC20s: no blocklist, pause, rebase, fee on transfer, admin burn or mint-from-holder, upgrade into any of these, or second entry point (a second address that moves the same balances). Exact incoming balance checks reject ordinary fee-on-transfer tokens, and the recovery check above stops a second entry point from draining owed balances, but neither can stop a token from shorting its own claimers later. A token that fails stops only its own claims (`claim` of the others, `claimTo` and `removeRewardToken` keep everything else working); entitlements and cursors survive.
+- **Reward tokens** must be plain ERC20s: no blocklist, pause, rebase, fee on transfer, admin burn or mint-from-holder, upgrade into any of these, or second entry point (a second address that moves the same balances). **Never register an alias or shared-ledger token** (two addresses over one balance, or two registered tokens sharing a ledger, PULP included): `reserved` is computed per token address, so the recovery check can't protect a shared ledger, and claims of one would spend the other's backing. Exact incoming balance checks reject ordinary fee-on-transfer tokens, and the recovery check above stops a second entry point from draining owed balances, but neither can stop a token from shorting its own claimers later. A token that fails stops only its own claims (`claim` of the others, `claimTo` and `removeRewardToken` keep everything else working); entitlements and cursors survive.
 - **A bad token that keeps being funded (re-review I-4).** `removeRewardToken` needs every open and future day of the token to be empty, so a distributor that funds it every day keeps it unremovable (and `claimAll` failing for everyone, if the token reverts). The fix is to revoke that distributor (`setDistributor(distributor, false)`) and wait 8 days: its last funding reaches at most 7 days ahead, after which nothing is scheduled and the token can be removed (retired, so still claimable). Per-token `claim(token, n)` / `claimTo` of every other token works throughout.
 - A token-level freeze can block principal withdrawal; the vault cannot bypass the underlying token.
 - The actual PULP, wrapper implementation, decimals, blacklist/pool restrictions and upgrade/admin capabilities must be verified before real deployment. `code.length` alone is not compatibility verification.
@@ -263,7 +303,7 @@ This is a **contract-level** guarantee (audit DOS-6): `withdraw()` succeeds and 
 
 | Party | Power |
 |---|---|
-| Vault owner | As above. Through the exit it can stop future accrual at any second and send the not-yet-earned remainder (the rest of the exit day plus up to seven funded days) to the treasury. It can change the treasury only 8 days after proposing it. |
+| Vault owner | As above. Through the exit it can stop future accrual at any second and send the not-yet-earned remainder (the rest of the exit day plus every funded day after it) to the treasury. It can change the treasury only 8 days after proposing it, 8 days after the last release, and once every funded reward has been earned. It can retire a token (only once all its days are over), which starts the 120-day claim deadline. |
 | Distributor | Funding only: whether, when, how much. |
 | Treasury | Receives fees and recoveries, and can trigger recoveries to itself; can't reach principal or owed rewards. |
 | WETH (`aeWETH`) | Upgradeable by Robinhood Chain's UpgradeExecutor; its bridge gateway can burn any holder's WETH, including the vault's reward balance. |
@@ -283,7 +323,9 @@ Worst cases measured in the re-review (Hardhat, Cancun rules; Robinhood Chain ad
 | `compound(64, …)` | about 0.74M |
 | `claim(token, 64)` | about 0.72M |
 | `claimAll(64)` with 5 reward tokens | about 1.97M |
-| `enableEmergencyExit` | up to about 2.79M with 5 reward tokens |
+| `enableEmergencyExit` | up to about 2.79M with 5 reward tokens (each retired token adds one budget read) |
+| `acceptTreasury` | about 374k with 5 active + 10 retired tokens |
+| `recoverExcess` / `recoverERC20` | about 392k with 5 active + 10 retired tokens (16 capped balance reads, twice) |
 | `withdraw`, matured | about 53k |
 | `withdraw`, after the emergency exit | about 74k |
 
@@ -314,15 +356,16 @@ RPC) and optionally pins `FORK_BLOCK`.
 | `test/vault/emergency.test.js` | the exit switch, exact exit-day payouts, releases, the withdrawal guarantee and the ABI classification of every state-changing function |
 | `test/vault/fixes.test.js` | audit fixes: treasury, recovery checks, `claimTo`, `removeRewardToken`, native ETH, events |
 | `test/vault/treasury.test.js` | the 8-day treasury delay, cancellation on ownership change, recovery by the treasury, flaky tokens |
+| `test/vault/audits.test.js` | external audits A1/A2: the treasury attack with funding before launch, recycled budgets, the release clock; the registry deadlock, the 120-day claim deadline and expiry; typo protection |
 | `test/vault/security.test.js` | reentrancy, false-returning / fee-on-transfer / blocking tokens, principal protection, ownership |
 | `test/vault/deploy.test.js` | `scripts/deploy-vault.js` helpers: dates, refused addresses, the handover verdict |
-| `test/vault/model.test.js` | randomized actions checked against an independent BigInt model after every step |
+| `test/vault/model.test.js` | randomized actions checked against an independent BigInt model after every step, including a third reward token's remove / re-add / expire lifecycle and treasury handovers |
 | `test/vault/fork.test.js` | opt-in mainnet fork with the real $PULP and WETH |
 
 ## Validation history
 
 How the contract got to its current source (SHA-256
-`a8bb34b40faec1de7913a38222b645bf4914fae63afc18b54743265ca7c9f0d4`). These are local results, not a public
+`647e8ae861b1cc0b50df41891bcd2dc5b5752556842a3ce71abc626b8e8ba4d2`). These are local results, not a public
 deployment or an external audit.
 
 - **Base design (2026-10-06).** 10/20/30-day locks, launch bonus, daily power-time settlement, paginated claims,
@@ -353,6 +396,10 @@ deployment or an external audit.
   Runtime bytecode 21,201 bytes. **131 tests, 16 soak seeds, 7 fork tests** (block 84,772,813).
 - **This repository (2026-10-10).** The same source, built and tested together with PulpZap: 131 vault unit tests
   in `npm test`, 16 soak seeds, and the 7 vault fork tests again passing on a fresh fork (block 84,853,444).
+- **External audit fixes (2026-10-10).** Two external audits of the source above (`a8bb34b4…`). Treasury
+  acceptance waits until every funded reward is earned and 8 days after the last release (A1-2); 10 retired slots
+  and the 120-day claim deadline with `expireRewardToken` (A1-1, A2-4); typo protection for reward tokens and
+  beneficiaries (A2-3, A2-6). Runtime bytecode 22,427 bytes. **142 tests, 16 soak seeds (now with a third reward token's lifecycle and treasury handovers), 7 fork tests** (block 84,957,009).
 
 Gas figures measured along the way (Hardhat, Cancun rules): first 30-day lock 2,308,195 (2.44M worst case);
 top-up ~462k; extension ~612k (2.22M worst case); 64-day claim page 516,015; matured withdrawal after ten idle

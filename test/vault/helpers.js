@@ -19,7 +19,7 @@ async function fixture(options = {}) {
   const pulp = await Token.deploy('PULP', 'PULP', options.decimals ?? 18);
   const weth = await (await ethers.getContractFactory('MockWETH')).deploy();
   const block = await ethers.provider.getBlock('latest');
-  const launch = (BigInt(block.timestamp) / DAY + 2n) * DAY;
+  const launch = (BigInt(block.timestamp) / DAY + BigInt(options.launchInDays ?? 2)) * DAY;
   const config = {
     pulp: await pulp.getAddress(), weth: options.nativeDisabled ? ethers.ZeroAddress : await weth.getAddress(),
     owner: owner.address, distributor: distributor.address, launchStart: launch,
@@ -41,9 +41,11 @@ async function addReward(f, name = 'REWARD', decimals = 18, kind = 'MockERC20') 
   await token.connect(f.distributor).approve(await f.vault.getAddress(), MAX);
   return token;
 }
-// Mines to the first second a pending treasury may accept (TREASURY_DELAY after the proposal).
+// Mines to the first second a pending treasury may accept (TREASURY_DELAY after the proposal and after the
+// last release).
 async function passTreasuryDelay(vault) {
-  const at = (await vault.treasuryProposedAt()) + (await vault.TREASURY_DELAY());
+  const proposed = await vault.treasuryProposedAt(), released = await vault.lastReleasedAt();
+  const at = (proposed > released ? proposed : released) + (await vault.TREASURY_DELAY());
   if (BigInt((await ethers.provider.getBlock('latest')).timestamp) < at) await mineAt(at);
 }
 function area(boost, end, from, to) {

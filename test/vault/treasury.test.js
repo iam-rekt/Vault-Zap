@@ -2,7 +2,7 @@
 // wait TREASURY_DELAY = 8 days; the current treasury can sweep what it is due meanwhile), I-3 (capped,
 // conservative balance reads in the recovery reserve check).
 const { expect } = require('chai');
-const { ethers, DAY, WAD, PULP, mineAt, txAt, fixture, addReward } = require('./helpers');
+const { ethers, DAY, WAD, PULP, mineAt, txAt, fixture, addReward, passTreasuryDelay } = require('./helpers');
 
 const now = async () => BigInt((await ethers.provider.getBlock('latest')).timestamp);
 
@@ -106,8 +106,9 @@ describe('PulpVeVault: treasury changes wait TREASURY_DELAY (L-2)', function () 
     const released = await f.vault.recoverExcess.staticCall(weth);
     expect(released).to.be.greaterThan(60n * WAD);
     await expect(f.vault.connect(f.treasury).recoverExcess(weth)).to.changeTokenBalances(f.weth, [f.treasury, attacker], [released, 0n]);
-    // Eight days later the attacker's treasury takes over and finds nothing left to sweep.
-    await passDelay(f);
+    // Eight days after the proposal and the release the attacker's treasury takes over and finds nothing left.
+    expect(await f.vault.lastReleasedAt()).to.be.greaterThanOrEqual(await f.vault.treasuryProposedAt());
+    await passTreasuryDelay(f.vault);
     await f.vault.connect(attacker).acceptTreasury();
     await expect(f.vault.connect(attacker).recoverExcess(weth)).to.be.revertedWithCustomError(f.vault, 'NothingToRecover');
     // Alice's earned hour is untouched.
@@ -137,10 +138,6 @@ describe('PulpVeVault: treasury changes wait TREASURY_DELAY (L-2)', function () 
     await expect(f.vault.connect(f.treasury).enableEmergencyExit()).to.be.revertedWithCustomError(f.vault, 'OwnableUnauthorizedAccount');
   });
 });
-
-async function passDelay(f) {
-  await mineAt((await f.vault.treasuryProposedAt()) + 8n * DAY);
-}
 
 describe('PulpVeVault: balance reads in the recovery check are capped and conservative (I-3)', function () {
   async function flaky(f) {

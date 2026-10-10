@@ -793,17 +793,28 @@ describe('PulpVeVault: withdrawal cannot be blocked', function () {
   it('a PULP transfer hook cannot re-enter withdraw, and the withdrawal still lands', async function () {
     const f = await fixture({ tokenKind: 'MockReentrantToken' });
     const token = await f.pulp.getAddress(), vault = await f.vault.getAddress();
-    await lockBoth(f);
     // The token contract itself owns a matured lock, so a re-entrant withdraw() from it would be a real one.
-    await txAt(f.launch, () => f.vault.connect(f.carol).lockFor(token, PULP, 10));
+    // lockFor refuses the PULP address (typo protection), so the token opens its own lock through its callback:
+    // first it approves the vault, then it calls lock (each triggered by an ordinary transfer).
+    await f.pulp.mint(token, PULP);
+    await f.pulp.configureCallback(token, f.pulp.interface.encodeFunctionData('approve', [vault, PULP]), true);
+    await f.pulp.connect(f.carol).transfer(f.carol.address, 0n);
+    await f.pulp.configureCallback(ethers.ZeroAddress, '0x', false);
+    await lockBoth(f);
+    await f.pulp.configureCallback(vault, f.vault.interface.encodeFunctionData('lock', [PULP, 10]), true);
+    await txAt(f.launch, () => f.pulp.connect(f.carol).transfer(f.carol.address, 0n));
+    expect((await f.vault.locks(token)).amount).to.equal(PULP);
+    expect(await f.pulp.succeededCallbacks()).to.equal(2n);
+    await expect(f.vault.connect(f.carol).lockFor(token, PULP, 10)).to.be.revertedWithCustomError(f.vault, 'InvalidBeneficiary');
     await f.pulp.configureCallback(vault, f.vault.interface.encodeFunctionData('withdraw'), true);
+    const [attempted, succeeded] = [await f.pulp.attemptedCallbacks(), await f.pulp.succeededCallbacks()];
     await bothPaths(f, PULP); // two outgoing transfers, each with a re-entry attempt
-    expect(await f.pulp.attemptedCallbacks()).to.equal(2n);
-    expect(await f.pulp.succeededCallbacks()).to.equal(0n);
+    expect(await f.pulp.attemptedCallbacks()).to.equal(attempted + 2n);
+    expect(await f.pulp.succeededCallbacks()).to.equal(succeeded);
     expect((await f.vault.locks(token)).amount).to.equal(PULP);
     // Outside a vault call the same callback succeeds: the guard was what stopped it.
     await f.pulp.connect(f.alice).transfer(f.bob.address, 1n);
-    expect(await f.pulp.succeededCallbacks()).to.equal(1n);
+    expect(await f.pulp.succeededCallbacks()).to.equal(succeeded + 1n);
     expect((await f.vault.locks(token)).amount).to.equal(0n);
     expect(await f.pulp.balanceOf(vault)).to.equal(0n);
   });
@@ -814,7 +825,7 @@ describe('PulpVeVault: withdrawal cannot be blocked', function () {
     // Every state-changing entry point, by who may call it. A new one fails this test until classified.
     const USER = ['lock', 'lockFor', 'increaseAmount', 'increaseAmountFor', 'compound', 'extend', 'withdraw',
       'claim', 'claimTo', 'claimAll', 'claimAllTo', 'recycleEmptyRewards', 'releaseEmptyRewards', 'releasePostExitRewards',
-      'acceptOwnership', 'acceptTreasury'];
+      'acceptOwnership', 'acceptTreasury', 'expireRewardToken'];
     const DISTRIBUTOR = ['notifyRewardAmount', 'notifyRewardETH'];
     const OWNER = ['addRewardToken', 'removeRewardToken', 'setDistributor', 'setLocksPaused', 'setCompoundFee',
       'proposeTreasury', 'recoverERC20', 'recoverExcess', 'enableEmergencyExit', 'transferOwnership', 'renounceOwnership'];
