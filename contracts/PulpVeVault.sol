@@ -35,16 +35,12 @@ interface IWrappedNative {
  *      lock accrued before the switch); the rest of the exit day and every later day go back to the
  *      treasury (`releasePostExitRewards`/`releaseEmptyRewards`, then `recoverExcess`). Everything the
  *      owner can recover goes only to `treasury`, which changes only by a two-step handover that the new
- *      address can complete no sooner than TREASURY_DELAY (8 days) after the proposal and after the last
- *      release, and only once no reward token has a budget left that is not yet earned (see `acceptTreasury`).
- *      So a new treasury never receives rewards funded before it took over, except budgets of days on which
- *      no lock had any power and unclaimed rewards whose claim deadline ends after the change. The treasury
- *      itself may also trigger recoveries, so a sweep of what was already released can never be held back
- *      until a new treasury takes over.
+ *      address can complete no sooner than TREASURY_DELAY (8 days) after the proposal (a public notice).
+ *      The treasury itself may also trigger recoveries, so a sweep can never be held back until a new
+ *      treasury takes over. Recoveries never touch principal or earned rewards: those stay claimable forever.
  *
- *      A removed reward token that is still owed is "retired": still claimable, for CLAIM_DEADLINE (120
- *      days). Then anyone can `expireRewardToken` it: what is still unclaimed goes to the treasury and the
- *      token can never be a reward token again.
+ *      A removed reward token that is still owed is "retired": still claimable with `claim`/`claimTo`
+ *      forever, still reserved and protected, and it can be added again.
  */
 contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -56,18 +52,15 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     uint256 public constant REWARD_DAYS = 7;
     // Active reward tokens (claimAll pays them; only they can be funded).
     uint256 public constant MAX_REWARD_TOKENS = 5;
-    // Removed tokens still owed (retired). Each can be expired CLAIM_DEADLINE after it was retired.
+    // Removed tokens still owed (retired): claimable forever with `claim`/`claimTo`.
     uint256 public constant MAX_RETIRED_REWARD_TOKENS = 10;
-    // How long a retired token stays claimable. Afterwards `expireRewardToken` closes its books.
-    uint256 public constant CLAIM_DEADLINE = 120 days;
     uint256 public constant MAX_CLAIM_EPOCHS = 64;
     // Bounds boosted principal and all 31-day area arithmetic well below uint256.
     uint256 public constant MAX_TOTAL_LOCKED = type(uint128).max;
     // Hard cap on the compound fee: 2%. The owner can lower or raise it within this, never past it.
     uint16 public constant MAX_COMPOUND_FEE_BPS = 200;
     // A proposed treasury can accept only this long after the proposal, so the community has 8 days to react
-    // to `TreasuryProposed`. On its own the delay does not protect funded rewards (a budget can lie far ahead,
-    // before launch, or be re-scheduled by recycling): acceptance also waits until nothing is left unearned.
+    // to `TreasuryProposed`.
     uint256 public constant TREASURY_DELAY = 8 days;
     uint256 private constant BPS = 10_000;
     // Granularity of the lock-end index used once, at the switch (see `_scheduledAfter`). Divides DAY.
@@ -138,10 +131,6 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     uint64 public treasuryProposedAt;
     // Total area accrued on the exit day before `exitTimestamp` (the denominator for that day's payouts).
     uint256 public exitDayTotalArea;
-    // The last time rewards left the books (`enableEmergencyExit`, a release, `expireRewardToken`). A pending
-    // treasury can accept only TREASURY_DELAY after it too, so the current treasury always has 8 days to sweep
-    // released funds before a new one could.
-    uint256 public lastReleasedAt;
     mapping(address => bool) public isDistributor;
 
     // Units: 2 * integral(boosted * remainingSeconds dt). Common normalization
@@ -157,11 +146,6 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     // Removed while something was still owed: still claimable, reserved and protected, never fundable.
     address[] private _retiredRewardTokens;
     mapping(address => bool) public isRetiredRewardToken;
-    // When a retired token was retired (0 otherwise). It can be expired from retiredAt + CLAIM_DEADLINE.
-    mapping(address => uint256) public retiredAt;
-    // Expired: no books any more (claims revert NotRewardToken), and never a reward token again, so its old
-    // `epochRewards` and cursors can never be read as an entitlement again.
-    mapping(address => bool) public isExpiredRewardToken;
     mapping(address => mapping(uint256 => uint256)) public epochRewards;
     mapping(address => mapping(address => uint256)) public claimCursor;
     mapping(address => uint256) public totalNotified;
@@ -195,8 +179,6 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     event RewardSentTo(address indexed user, address indexed token, address indexed to, uint256 amount);
     event RewardTokenAdded(address indexed token);
     event RewardTokenRemoved(address indexed token, bool retired);
-    // Unclaimed `forfeited` left the books (into totalReleased): sweepable to the treasury by `recoverExcess`.
-    event RewardTokenExpired(address indexed token, uint256 forfeited);
     event DistributorSet(address indexed distributor, bool allowed);
     event LocksPausedSet(bool paused);
     event CompoundFeeSet(uint16 feeBps);
@@ -227,10 +209,6 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     error RewardTokenExists();
     error TooManyRewardTokens();
     error RewardsStillScheduled();
-    error UnearnedRewardsScheduled(address token, uint256 epoch);
-    error NotRetiredRewardToken();
-    error ClaimDeadlineNotReached(uint256 expiresAt);
-    error ExpiredRewardToken();
     error InvalidRewardToken();
     error NothingToFund();
     error NativeDisabled();
@@ -496,7 +474,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
 
     /// @notice Claim up to 64 recorded days. Repeat for longer histories.
     /// @dev Individual-token claiming prevents one bad reward token blocking another. Works for retired
-    ///      (removed but still owed) tokens too, until they are expired (CLAIM_DEADLINE after retirement).
+    ///      (removed but still owed) tokens too, forever.
     ///      `RewardPaid` is logged for every settled page, also when it pays 0 (the cursor still moves).
     function claim(address token, uint256 maxEpochs) external nonReentrant returns (uint256 amount) {
         if (!_hasBooks(token)) revert NotRewardToken();
@@ -618,7 +596,7 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     ///         day, which can be released first), so every entitlement is final. If nothing is owed any more
     ///         (notified == paid + released) the token is dropped entirely. Otherwise it is retired (at most
     ///         MAX_RETIRED_REWARD_TOKENS at once): still claimable with `claim`/`claimTo`, still in `reserved`,
-    ///         still protected from recovery, for CLAIM_DEADLINE; then anyone can `expireRewardToken` it.
+    ///         still protected from recovery, forever (or until it is added again).
     function removeRewardToken(address token) external onlyOwner nonReentrant {
         if (!isRewardToken[token]) revert NotRewardToken();
         (bool scheduled,) = _scheduledDay(token, _firstUnsettledDay());
@@ -629,32 +607,9 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         if (retired) {
             if (_retiredRewardTokens.length >= MAX_RETIRED_REWARD_TOKENS) revert TooManyRewardTokens();
             isRetiredRewardToken[token] = true;
-            retiredAt[token] = block.timestamp;
             _retiredRewardTokens.push(token);
         }
         emit RewardTokenRemoved(token, retired);
-    }
-
-    /// @notice The claim deadline: CLAIM_DEADLINE (120 days) after `token` was retired, anyone may close its
-    ///         books. Whatever is still unclaimed (notified - paid - released: unclaimed rewards, rounding dust,
-    ///         budgets of days nobody had power on) moves to `totalReleased`, so it leaves `reserved` and
-    ///         `recoverExcess` sweeps it to the treasury. The token leaves the retired list and loses its books:
-    ///         `claim`/`claimable` for it revert NotRewardToken. It can never be added again (ExpiredRewardToken),
-    ///         so no old day budget or cursor can ever pay out twice.
-    /// @dev Permissionless: it only applies a published deadline, and only ever frees a retired slot.
-    /// @return forfeited What was still owed and is now released.
-    function expireRewardToken(address token) external nonReentrant returns (uint256 forfeited) {
-        if (!isRetiredRewardToken[token]) revert NotRetiredRewardToken();
-        uint256 expiresAt = retiredAt[token] + CLAIM_DEADLINE;
-        if (block.timestamp < expiresAt) revert ClaimDeadlineNotReached(expiresAt);
-        forfeited = totalNotified[token] - totalPaid[token] - totalReleased[token];
-        totalReleased[token] += forfeited;
-        if (forfeited != 0) lastReleasedAt = block.timestamp;
-        isRetiredRewardToken[token] = false;
-        delete retiredAt[token];
-        isExpiredRewardToken[token] = true;
-        _removeFrom(_retiredRewardTokens, token);
-        emit RewardTokenExpired(token, forfeited);
     }
 
     function setDistributor(address distributor, bool allowed) external onlyOwner {
@@ -677,9 +632,8 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Step one of a treasury change: the new address may call `acceptTreasury` from
-    ///         `treasuryProposedAt + TREASURY_DELAY` (8 days) on, once every funded budget has been earned.
-    ///         Every proposal, even of the same address, restarts the clock; zero cancels. Watch
-    ///         `TreasuryProposed`: there are 8 days to react. The distributor should stop funding meanwhile.
+    ///         `treasuryProposedAt + TREASURY_DELAY` (8 days) on. Every proposal, even of the same address,
+    ///         restarts the clock; zero cancels. Watch `TreasuryProposed`: there are 8 days to react.
     function proposeTreasury(address newTreasury) external onlyOwner {
         if (newTreasury != address(0)) _checkTreasury(newTreasury);
         pendingTreasury = newTreasury;
@@ -687,23 +641,12 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit TreasuryProposed(newTreasury);
     }
 
-    /// @notice Step two: the proposed treasury takes over, once TREASURY_DELAY has passed since the proposal
-    ///         and since the last release (`lastReleasedAt`), and no reward token (active or retired) has a
-    ///         budget on any day not yet earned: before the exit today or later (with funding before launch:
-    ///         the 7 days from launch), after it every day after the exit day. So a new treasury can never
-    ///         receive rewards funded before it took over: they must all have been earned first, or released
-    ///         at least 8 days earlier, in which case the current treasury had those 8 days to sweep them.
-    /// @dev The window is the one `removeRewardToken` scans: every such budget lies in the 8 days from
-    ///      `_firstUnsettledDay()`. Reverts UnearnedRewardsScheduled(token, day) with the first one found.
-    ///      Without the release clock, a compromised owner could exit, release and accept in one block.
+    /// @notice Step two: the proposed treasury takes over, once TREASURY_DELAY has passed since the proposal.
     function acceptTreasury() external {
         address next = pendingTreasury;
         if (msg.sender != next) revert NotPendingTreasury();
-        uint256 acceptableAt = Math.max(treasuryProposedAt, lastReleasedAt) + TREASURY_DELAY;
+        uint256 acceptableAt = uint256(treasuryProposedAt) + TREASURY_DELAY;
         if (block.timestamp < acceptableAt) revert TreasuryDelayNotOver(acceptableAt);
-        uint256 first = _firstUnsettledDay();
-        _checkNothingScheduled(rewardTokens, first);
-        _checkNothingScheduled(_retiredRewardTokens, first); // none by construction; checked anyway
         _checkTreasury(next); // a reward token may have been registered since the proposal
         emit TreasuryChanged(treasury, next);
         treasury = next;
@@ -729,7 +672,6 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emergencyExit = true;
         exitTimestamp = SafeCast.toUint64(x);
         exitDayTotalArea = total;
-        lastReleasedAt = x;
         uint256 elapsed = x - day * DAY;
         _scaleExitDay(rewardTokens, day, elapsed, total);
         _scaleExitDay(_retiredRewardTokens, day, elapsed, total); // none have a budget here; kept for safety
@@ -775,9 +717,9 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Send the balance above `reserved(token)` to the treasury: PULP or reward tokens sent straight
-    ///         to the vault, released budgets, expired unclaimed rewards, or (token = address(0)) native ETH
-    ///         forced into the vault. Owner or treasury: while a new treasury is pending, the current one can
-    ///         sweep what was already released even if the owner holds it back for the new one.
+    ///         to the vault, released budgets, or (token = address(0)) native ETH forced into the vault.
+    ///         Owner or treasury: while a new treasury is pending, the current one can sweep what it is due
+    ///         even if the owner holds it back for the new one.
     function recoverExcess(address token) external onlyOwnerOrTreasury nonReentrant returns (uint256 amount) {
         address to = treasury;
         if (token == address(0)) {
@@ -932,7 +874,6 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         if (amount == 0) return 0;
         epochRewards[token][epoch] = 0;
         totalReleased[token] += amount;
-        lastReleasedAt = block.timestamp;
         emit EmptyRewardsReleased(token, epoch, amount);
     }
 
@@ -991,19 +932,16 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         emit Increased(user, amount, multiplier, powerOf(user));
     }
 
-    /// @dev Never the vault itself (its balances are the books), the treasury or a pending treasury, or an
-    ///      expired token (its old budgets must never be read again). Reactivating a retired token keeps its
-    ///      books and clears its retirement time.
+    /// @dev Never the vault itself (its balances are the books), the treasury or a pending treasury.
+    ///      Reactivating a retired token keeps its books: its cursors and settled day budgets carry on.
     function _addRewardToken(address token) private {
         if (token == address(this)) revert InvalidRewardToken();
         if (token.code.length == 0) revert NotAContract();
         if (isRewardToken[token]) revert RewardTokenExists();
-        if (isExpiredRewardToken[token]) revert ExpiredRewardToken();
         if (token == treasury || token == pendingTreasury) revert InvalidTreasury();
         if (rewardTokens.length >= MAX_REWARD_TOKENS) revert TooManyRewardTokens();
         if (isRetiredRewardToken[token]) {
             isRetiredRewardToken[token] = false;
-            delete retiredAt[token];
             _removeFrom(_retiredRewardTokens, token);
         }
         isRewardToken[token] = true;
@@ -1024,8 +962,9 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
         return isRewardToken[token] || isRetiredRewardToken[token];
     }
 
-    /// @dev First day that may still hold a budget nobody has fully earned: before the exit today (still open)
-    ///      or, before launch, the launch day; after the exit the day after the exit day (or the launch day).
+    /// @dev (`removeRewardToken`) First day that may still hold a budget nobody has fully earned: before the
+    ///      exit today (still open) or, before launch, the launch day; after the exit the day after the exit
+    ///      day (or the launch day).
     ///      Every budget was scheduled by `_scheduleRewards` over the seven days from `max(t + 1, launch day)`
     ///      for some funding/recycling day `t` (before the switch, if exited), so every budget on a day >= this
     ///      one lies in the REWARD_DAYS + 1 days from it.
@@ -1039,14 +978,6 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     function _scheduledDay(address token, uint256 first) private view returns (bool found, uint256 epoch) {
         for (uint256 i; i <= REWARD_DAYS; ++i) {
             if (epochRewards[token][first + i] != 0) return (true, first + i);
-        }
-    }
-
-    /// @dev At most 15 tokens x 8 days of reads (`acceptTreasury`).
-    function _checkNothingScheduled(address[] storage tokens, uint256 first) private view {
-        for (uint256 i; i < tokens.length; ++i) {
-            (bool found, uint256 epoch) = _scheduledDay(tokens[i], first);
-            if (found) revert UnearnedRewardsScheduled(tokens[i], epoch);
         }
     }
 
@@ -1115,25 +1046,23 @@ contract PulpVeVault is Ownable2Step, ReentrancyGuard {
     }
 
     /// @dev The vault can never call withdraw, so a lock it owned would strand principal forever; tokens
-    ///      claimed to it would leave the books and become sweepable. PULP, WETH and reward tokens (active,
-    ///      retired or expired) are token contracts that can't withdraw or move what they receive either: a
+    ///      claimed to it would leave the books and become sweepable. PULP, WETH and reward tokens (active
+    ///      or retired) are token contracts that can't withdraw or move what they receive either: a
     ///      pasted token address instead of a wallet (typo protection).
     function _checkBeneficiary(address beneficiary) private view {
         if (beneficiary == address(0)) revert ZeroAddress();
         if (
             beneficiary == address(this) || beneficiary == address(pulp) || beneficiary == weth ||
-            _hasBooks(beneficiary) || isExpiredRewardToken[beneficiary]
+            _hasBooks(beneficiary)
         ) revert InvalidBeneficiary();
     }
 
-    /// @dev Never the vault (fees would stay in the balance but leave `reserved`), PULP, WETH, a reward token
-    ///      (active or retired) or an expired one: token contracts can't move what they receive (typo protection).
+    /// @dev Never the vault (fees would stay in the balance but leave `reserved`), PULP, WETH or a reward
+    ///      token (active or retired): token contracts can't move what they receive (typo protection).
     ///      WETH is refused by address too, so it stays refused even after it is removed as a reward token.
     function _checkTreasury(address t) private view {
         if (t == address(0)) revert ZeroAddress();
-        if (
-            t == address(this) || t == address(pulp) || t == weth || _hasBooks(t) || isExpiredRewardToken[t]
-        ) revert InvalidTreasury();
+        if (t == address(this) || t == address(pulp) || t == weth || _hasBooks(t)) revert InvalidTreasury();
     }
 
     function _checkCapacity(uint256 amount) private view {

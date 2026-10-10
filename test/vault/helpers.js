@@ -41,11 +41,9 @@ async function addReward(f, name = 'REWARD', decimals = 18, kind = 'MockERC20') 
   await token.connect(f.distributor).approve(await f.vault.getAddress(), MAX);
   return token;
 }
-// Mines to the first second a pending treasury may accept (TREASURY_DELAY after the proposal and after the
-// last release).
+// Mines to the first second a pending treasury may accept (TREASURY_DELAY after the proposal).
 async function passTreasuryDelay(vault) {
-  const proposed = await vault.treasuryProposedAt(), released = await vault.lastReleasedAt();
-  const at = (proposed > released ? proposed : released) + (await vault.TREASURY_DELAY());
+  const at = (await vault.treasuryProposedAt()) + (await vault.TREASURY_DELAY());
   if (BigInt((await ethers.provider.getBlock('latest')).timestamp) < at) await mineAt(at);
 }
 function area(boost, end, from, to) {

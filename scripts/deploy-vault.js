@@ -563,8 +563,8 @@ async function main() {
   // no default: everything the owner can ever recover goes here, and only here
   const treasury = await setting(cfg, 'treasury', 'treasury (receives the compound fee and everything recovered; a Safe multisig)',
     (t) => checkTreasuryAddress(toAddress(t), { pulp: pulp.address, weth: weth.address, vault: predicted, chainId }));
-  if (treasury === deployer.address) say(yellow('  heads up: the treasury is the deployer’s hot key. a multisig is safest; it can be changed later (two-step, at least 8 days).'));
-  else if (isEoaCode(await provider.getCode(treasury))) say(yellow(`  note: the treasury ${treasury} is an EOA (no contract code): one key receives the compound fee and every recovery. allowed, but a multisig is safest; changing it later takes at least 8 days.`));
+  if (treasury === deployer.address) say(yellow('  heads up: the treasury is the deployer’s hot key. a multisig is safest; it can be changed later (two-step, 8-day delay).'));
+  else if (isEoaCode(await provider.getCode(treasury))) say(yellow(`  note: the treasury ${treasury} is an EOA (no contract code): one key receives the compound fee and every recovery. allowed, but a multisig is safest; changing it later takes 8 days.`));
   const chainNow = (await provider.getBlock('latest')).timestamp;
   const launchStart = await setting(cfg, 'launchStart', 'locking opens on (a UTC date; it opens at 00:00 UTC; or a unix time)', (t) => parseLaunch(t, chainNow),
     new Date(nextMidnight(chainNow) * 1000).toISOString().slice(0, 10));
@@ -601,7 +601,7 @@ async function main() {
   row('WETH', `${weth.address}  ${dim(`${weth.symbol}, ${weth.decimals} decimals`)}`);
   row('fees sent by', [distributor, ...extras].join(', '));
   row('final owner', `${owner} ${dim('(two-step: offered here, accepted by the owner)')}`);
-  row('treasury', `${treasury} ${dim('(compound fee and every recovery; changes only two-step, 8 days after a proposal, once every funded reward is earned)')}`);
+  row('treasury', `${treasury} ${dim('(compound fee and every recovery; changes only two-step, 8 days after a proposal)')}`);
   row('locking opens', `${utc(launchStart)} ${dim(`(in ${ahead(launchStart - chainNow)})`)}`);
   row('owner accepts by', utc(launchStart - HANDOVER_BEFORE_LAUNCH));
   row('launch bonus', `2× at launch, falling to 1× over ${hours(earlyWindow)}`);
@@ -668,7 +668,7 @@ async function main() {
     rewards: await vault.getRewardTokens(), owner: await vault.owner(), pending: await vault.pendingOwner(),
     feeBps: Number(await vault.compoundFeeBps()), treasury: await vault.treasury(), pendingTreasury: await vault.pendingTreasury(),
     emergencyExit: await vault.emergencyExit(), locksPaused: await vault.locksPaused(),
-    retired: await vault.getRetiredRewardTokens(), claimDeadline: Number(await vault.CLAIM_DEADLINE()),
+    retired: await vault.getRetiredRewardTokens(),
     treasuryDelay: Number(await vault.TREASURY_DELAY()),
   };
   const check = (label, ok, detail = '') => {
@@ -689,8 +689,8 @@ async function main() {
   const want = [weth.address, ...(pulpRewards ? [pulp.address] : [])];
   const names = got.rewards.map((a) => (a === weth.address ? weth.symbol : a === pulp.address ? pulp.symbol : a)).join(', ');
   check('reward tokens', got.rewards.length === want.length && want.every((a) => got.rewards.includes(a)), names);
-  check('no retired reward tokens', got.retired.length === 0, `claim deadline ${got.claimDeadline / DAY} days after a token is retired`);
-  check('treasury delay', got.treasuryDelay === 8 * DAY, `${got.treasuryDelay / DAY} days, and only once every funded reward is earned`);
+  check('no retired reward tokens', got.retired.length === 0);
+  check('treasury delay', got.treasuryDelay === 8 * DAY, `${got.treasuryDelay / DAY} days after a proposal`);
   check(`ownership offered to ${short(owner)}`, got.pending === owner && got.owner === deployer.address,
     `pendingOwner ${got.pending}; the deployer owns it until ${short(owner)} calls acceptOwnership()`);
 

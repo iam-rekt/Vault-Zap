@@ -106,8 +106,7 @@ describe('PulpVeVault: treasury changes wait TREASURY_DELAY (L-2)', function () 
     const released = await f.vault.recoverExcess.staticCall(weth);
     expect(released).to.be.greaterThan(60n * WAD);
     await expect(f.vault.connect(f.treasury).recoverExcess(weth)).to.changeTokenBalances(f.weth, [f.treasury, attacker], [released, 0n]);
-    // Eight days after the proposal and the release the attacker's treasury takes over and finds nothing left.
-    expect(await f.vault.lastReleasedAt()).to.be.greaterThanOrEqual(await f.vault.treasuryProposedAt());
+    // Eight days after the proposal the attacker's treasury takes over and finds nothing left.
     await passTreasuryDelay(f.vault);
     await f.vault.connect(attacker).acceptTreasury();
     await expect(f.vault.connect(attacker).recoverExcess(weth)).to.be.revertedWithCustomError(f.vault, 'NothingToRecover');

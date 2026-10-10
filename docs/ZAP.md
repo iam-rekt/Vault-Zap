@@ -124,7 +124,7 @@ Rules (checked before any swap, mirroring the vault):
 
 - `beneficiary` must not be zero, the zap, the vault, WETH, PULP, the PoolManager or the hook (`InvalidBeneficiary`):
   none of them can ever withdraw a lock, and a refund to WETH would be minted back to the zap and stranded.
-  The vault additionally refuses any other registered, retired or expired reward token as a beneficiary; the zap
+  The vault additionally refuses any other registered or retired reward token as a beneficiary; the zap
   doesn't pre-check that, so a strict zap to such an address reverts and an OrRefund zap refunds to it (before, the
   lock would have been opened for it; either way the funds are as lost as a lock nobody can withdraw).
 - No lock: opens a new lock of `daysLocked` in {10, 20, 30}; `minPulpOut >= vault.minLockAmount()`.

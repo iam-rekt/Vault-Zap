@@ -39,7 +39,7 @@ from the tax. Rewards only ever come from tax that was actually collected; nothi
 | **Power** | amount × time left × launch bonus. A 30-day lock starts at full power, 10 days at a third. Power falls every second toward the unlock date. |
 | **Launch bonus** | Locks made at launch count 2×, falling to 1× over the bonus window (24 hours in the example). A lock keeps its bonus as long as it is extended. |
 | **Add / extend** | Add more $PULP (at today's bonus) while 10+ days remain. Extend any time to push the unlock date later and top power back up. |
-| **Rewards** | Each funding is spread over the next 7 full UTC days; each day is shared by everyone's power during that day. A day is claimable once it ends (midnight UTC). Unclaimed rewards stay claimable as long as the token is a reward token; once the owner removes (retires) a token, **claim it within 120 days**: afterwards anyone can expire it and what is unclaimed goes to the treasury. |
+| **Rewards** | Each funding is spread over the next 7 full UTC days; each day is shared by everyone's power during that day. A day is claimable once it ends (midnight UTC). **Earned rewards are claimable forever** and nobody, the owner included, can take them: a token the owner removes while something is still owed is retired, and stays claimable (`claim` / `claimTo`) with no deadline. |
 | **Compound** | Put your claimable $PULP rewards straight into your lock, minus a compound fee (at most 2%) paid to the treasury. `claim` + `increaseAmount` does the same for free in two transactions. |
 | **For someone else** | `lockFor` / `increaseAmountFor` lock your $PULP into another wallet's lock; it becomes theirs. Token addresses ($PULP, WETH, any reward token) and the vault are refused as beneficiaries, also for `claimTo` / `claimAllTo` (typo protection). |
 | **Withdraw** | After the unlock date, take the $PULP back. Rewards stay claimable. |
@@ -102,7 +102,7 @@ behaviour, not real gas costs.
 
 | Suite | Tests (last run, 2026-10-10) |
 |---|---|
-| `npm test` | 224 passing (149 vault, 70 zap, 5 zap deploy-script helpers), 21 pending (the fork and local-node suites, run by the commands below) |
+| `npm test` | 220 passing (145 vault, 70 zap, 5 zap deploy-script helpers), 21 pending (the fork and local-node suites, run by the commands below) |
 | `npm run test:soak` | 16 passing |
 | `npm run test:deploy` | 11 passing |
 | `npm run test:fork` | vault 7 passing, zap 8 passing |
@@ -131,7 +131,7 @@ npm run deploy:vault -- --config config/vault.json --dry-run
 | `weth` | The wrapped native token rewards are paid in (`0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73`). Must accept ETH through `deposit()`. |
 | `distributor` | The fee wallet allowed to fund rewards (`notifyRewardETH` / `notifyRewardAmount`), for example an EOA. More can be added (`extraDistributors`); the owner can add or remove distributors later. |
 | `owner` | The **final owner, a Safe multisig**. No default. On Robinhood Chain it must be a contract unless `--allow-eoa-owner`; never the deployer, $PULP, WETH or the PoolManager. |
-| `treasury` | Receives the compound fee and every recovery, nothing else. No default; never a token ($PULP, WETH or a known one), the PoolManager or the vault. Use a Safe multisig. Changing it later takes at least 8 days, and only once every funded reward has been earned. |
+| `treasury` | Receives the compound fee and every recovery, nothing else. No default; never a token ($PULP, WETH or a known one), the PoolManager or the vault. Use a Safe multisig. Changing it later takes an 8-day public notice. |
 | `launchStart` | The day locking opens, as a UTC date (`2026-10-20`) or unix time. **Always 00:00 UTC**, at least two hours ahead. Dates that don't exist are refused. |
 | `earlyWindowHours` | The launch bonus window: 2× at launch falling to 1× over this many hours (example 24; under 1 needs `--force`). |
 | `minLockAmountTokens` | The minimum new lock in whole tokens. **Default 35,000** $PULP. Fixed forever once deployed; re-check its dollar value first. It is also the cost of the `lockFor` griefing described in [docs/TECHNICAL.md](docs/TECHNICAL.md#griefing-through-lockfor). |
@@ -204,14 +204,14 @@ address into a frontend's `lock/config.js`). Details: [docs/TECHNICAL.md](docs/T
 |---|---|---|
 | **Owner** | A Safe multisig | Settings (pause new locks, compound fee within 0–2%, distributors), which reward-token types exist (add / remove), proposing a treasury, and the one-way emergency exit. Can't take principal or earned rewards. |
 | **Distributor(s)** | Wallets the owner whitelists, for example the fee wallet (an EOA is fine) | The only addresses that fund rewards: `notifyRewardETH()` (or a plain ETH transfer) and `notifyRewardAmount(token, amount)`. Funding only adds; a distributor can't take anything out. Adding reward-token *types* stays with the owner. |
-| **Treasury** | Set at deploy (use a Safe); changes only two-step (below) | Receives the compound fee, mistaken transfers (`recoverERC20` / `recoverExcess`), rewards released after an emergency exit and expired unclaimed rewards. It can trigger those recoveries itself. |
+| **Treasury** | Set at deploy (use a Safe); changes only two-step (below) | Receives the compound fee, mistaken transfers (`recoverERC20` / `recoverExcess`), rewards released after an emergency exit. It can trigger those recoveries itself. |
 
 ## What the owner can and can't do
 
 **Vault owner can:** pause *new* principal (locks, adds, `lockFor`, `increaseAmountFor`, `compound`; extending,
 withdrawing and claiming always work: the pause deliberately doesn't cover `extend`), set the compound fee within
 0–2%, approve distributors, add up to five reward tokens and remove one once nothing is scheduled for it (a removed
-token that is still owed stays claimable for 120 days, up to ten at a time), hand ownership over (two-step), propose a new
+token that is still owed is retired and stays claimable forever, up to ten at a time), hand ownership over (two-step), propose a new
 treasury, send tokens sent here by mistake to the treasury (`recoverERC20`, `recoverExcess`), and turn on the
 emergency exit, once and for good.
 
@@ -221,15 +221,13 @@ bonus, stop or delay withdrawals or claims, turn the exit off, upgrade the contr
 `recoverExcess` only moves the balance above `reserved` (all principal plus every reward not yet paid), and after
 every recovery the vault checks that no protected balance fell below what it owes.
 
-**Treasury changes.** The treasury changes only in two steps: the owner proposes (`TreasuryProposed`), and the
-new address accepts **no sooner than 8 days later** (and 8 days after the last release of rewards), **and only once
-every funded reward has been earned**: while any reward token still has a budget on today or a later day (funding
-before launch: until launch + 7 days; after an emergency exit: until the days after the exit day are released),
-`acceptTreasury` reverts. So a new treasury never receives rewards funded before it took over. When a change is
-proposed the distributor stops funding, and acceptance becomes possible once everything funded is earned. A new
-proposal restarts the clock, proposing zero cancels, and every ownership change cancels a pending proposal. The
-*current* treasury can trigger recoveries to itself during the window: that covers funds already released (for
-example after an exit), which it has at least 8 days to sweep.
+**Treasury changes.** The treasury changes only after an **8-day public notice**: the owner proposes
+(`TreasuryProposed`), and the new address can accept no sooner than 8 days later. A new proposal restarts the
+clock, proposing zero cancels, and every ownership change cancels a pending proposal. The *current* treasury can
+trigger recoveries to itself during the window. **Accepted residual:** a compromised owner Safe could, after that
+notice, redirect funded-but-unearned rewards (budgets of days not yet earned, released by an emergency exit) to a
+new treasury. Never principal, never earned rewards. Watch `TreasuryProposed`, `RewardTokenAdded` and
+`EmergencyExitEnabled`.
 
 **Emergency exit rules.** Once on (it can never be switched off):
 
@@ -241,10 +239,9 @@ example after an exit), which it has at least 8 days to sweep.
 - leaving costs nothing compared with staying, and no locker can change another's rewards by staying or leaving;
 - the unearned rest goes back only to the treasury (anyone can release it, `recoverExcess` sweeps it). A
   compromised owner can at most stop future accrual early and send the not-yet-earned part (the rest of the exit
-  day and every funded day after it) to the treasury; the current treasury has at least 8 days to sweep it before
-  any newly proposed treasury could take over.
-- the owner can retire each reward token once the days after the exit day are released; from then on lockers have
-  **120 days to claim** before the unclaimed rest goes to the treasury.
+  day and every funded day after it) to the treasury (or, after the 8-day notice, to a new one).
+- the owner can retire each reward token once the days after the exit day are released; lockers can still claim
+  everything they earned, forever.
 - `enableEmergencyExit` costs up to about 2.8M gas, and estimates can be about 1.3M too low: **send it with a fixed
   gas limit of at least 3.5M.**
 
@@ -281,7 +278,7 @@ What the contracts can't protect against. None of these is a bug in them; they a
 
 | Who / what | What they can do |
 |---|---|
-| **Vault owner** (a multisig) | Pause new locks, set the compound fee (0–2%), manage reward tokens and distributors (retiring a token starts its 120-day claim deadline), propose a treasury (effective 8 days later at the earliest, and only once every funded reward is earned), recover strays to the treasury, and turn on the emergency exit (stopping future rewards and returning the unearned part to the treasury). Can't take principal or earned rewards. |
+| **Vault owner** (a multisig) | Pause new locks, set the compound fee (0–2%), manage reward tokens and distributors (a retired token stays claimable forever), propose a treasury (effective after an 8-day public notice; if compromised, it could then route funded-but-unearned rewards to it), recover strays to the treasury, and turn on the emergency exit (stopping future rewards and returning the unearned part to the treasury). Can't take principal or earned rewards. |
 | **Zap owner** (a multisig) | Raise the zap fee up to 2% (within each caller's `maxFeeBps`), redirect it, sweep strays to the fee recipient. |
 | **Distributor** | Decides whether, when and how much to fund. Locking is not a promise of rewards. |
 | **Treasury** | Receives the compound fee, recoveries and the zap fee, and can trigger vault recoveries to itself. Can't reach principal or owed rewards. |
@@ -302,16 +299,20 @@ protect a ledger two registered addresses share. Details: [docs/TECHNICAL.md](do
 - Two internal security reviews (2026-10-09, 2026-10-10) and a checklist audit across 11 EVM checklists with an
   end-to-end run on a fork of Robinhood Chain (38 simulated days, 630 transactions, every invariant held), followed
   by a re-review of the fixes. All AI-assisted, done for the project.
-- Two external audits of the vault (A1, A2) on its previous source. Fixed: the treasury handover now waits until
-  every funded reward is earned (A1-2), reward-token slots can't deadlock (10 retired slots and a 120-day claim
-  deadline, A1-1, A2-4), and token addresses are refused as reward tokens or beneficiaries where they would be a
-  typo (A2-3, A2-6). **These fixes have not been externally reviewed yet; the zap has had no external audit.**
+- Two external audits of the vault (A1, A2) on its previous source, then two more external reviews (R4, R5) of the
+  fixes. Kept: up to 10 retired reward-token slots (5 active), token addresses refused as reward tokens or
+  beneficiaries where they would be a typo (A2-3, A2-6), the return-bomb-safe balance reads. After R4/R5 the
+  claim deadline and the extra treasury-acceptance rules were removed again: **earned rewards are claimable
+  forever**, and the treasury changes only after the 8-day notice. Accepted residual (A1-2): a compromised owner Safe
+  could, after that notice, route funded-but-unearned rewards to a new treasury, never principal or earned rewards.
+  Accepted (R5-3): if both registry lists are ever full, a broken active token stays in `claimAll`, but per-token
+  `claim` always works. **The zap has had no external audit.**
 - Results of the internal reviews: the checklist audit's three Mediums (exit-day/treasury owner trust, bridge gas
   estimation, sandwiches on a thin pool) and all Lows are fixed or documented, and the re-review's three Lows are
   fixed. A later adversarial review of the A1/A2 fixes (review 3) found H-1 and M-1, two ways a **compromised owner
   Safe** could still route the protocol's own *unearned* reward budgets to a new treasury (never principal or earned
   rewards): accepted as owner-trust residuals and documented. Its L-1 (a gas "return bomb" in recovery balance reads)
-  and I-1 (the treasury check now also refuses WETH and expired tokens) are fixed.
+  and I-1 (the treasury check now also refuses WETH) are fixed.
 - Tests on the final sources: see the table under Quick start.
 
 Full findings, fixes and evidence: [docs/SECURITY.md](docs/SECURITY.md).
@@ -357,7 +358,7 @@ token paired with native ETH on a Uniswap v4 chain. What to change:
 
 | Path | What |
 |---|---|
-| `contracts/PulpVeVault.sol` | The vault (sha256 `647e8ae861b1cc0b50df41891bcd2dc5b5752556842a3ce71abc626b8e8ba4d2`) |
+| `contracts/PulpVeVault.sol` | The vault (sha256 `c3bf146418b23d7a915848b4294218f20d5dcd1a2c7bca927f3ba2e2eaad7062`) |
 | `contracts/PulpZap.sol` | The zap (sha256 `871cbf4865ca76c1bd567124fd414deaa87a46c1798c11262002f4cf5897c042`) |
 | `contracts/interfaces/` | `IPulpVeVault` (the vault functions the zap uses, plus WETH9) and minimal Uniswap v4 types (`IUniswapV4`) |
 | `contracts/test/` | Test-only mocks: tokens (plain, fee-on-transfer, false-return, blocking, pausable, re-entrant, two-address, breakable), `MockWETH`, `MockWETH9`, a mock v4 PoolManager, bridge executor, hostile receivers. Never deployed by the scripts |

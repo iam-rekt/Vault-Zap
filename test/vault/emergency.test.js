@@ -825,7 +825,7 @@ describe('PulpVeVault: withdrawal cannot be blocked', function () {
     // Every state-changing entry point, by who may call it. A new one fails this test until classified.
     const USER = ['lock', 'lockFor', 'increaseAmount', 'increaseAmountFor', 'compound', 'extend', 'withdraw',
       'claim', 'claimTo', 'claimAll', 'claimAllTo', 'recycleEmptyRewards', 'releaseEmptyRewards', 'releasePostExitRewards',
-      'acceptOwnership', 'acceptTreasury', 'expireRewardToken'];
+      'acceptOwnership', 'acceptTreasury'];
     const DISTRIBUTOR = ['notifyRewardAmount', 'notifyRewardETH'];
     const OWNER = ['addRewardToken', 'removeRewardToken', 'setDistributor', 'setLocksPaused', 'setCompoundFee',
       'proposeTreasury', 'recoverERC20', 'recoverExcess', 'enableEmergencyExit', 'transferOwnership', 'renounceOwnership'];

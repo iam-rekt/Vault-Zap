@@ -7,7 +7,7 @@
 //             reviewer's PoCs and pin down exactly that bound.
 //   L-1       FIXED: a "return bomb" in the recovery balance reads (all returndata copied into memory) made a
 //             recovery cost up to ~69M gas with 15 hostile tokens; reads now use a fixed 32-byte output buffer.
-//   I-1       FIXED: the treasury check also refuses WETH (by address) and expired reward tokens.
+//   I-1       FIXED: the treasury check also refuses WETH (by address).
 const { expect } = require('chai');
 const { ethers, DAY, WAD, PULP, mineAt, txAt, fixture, addReward, passTreasuryDelay } = require('./helpers');
 
@@ -71,24 +71,11 @@ describe('PulpVeVault: review 3 M-1 (accepted): zero-power days made by pausing 
     await f.vault.enableEmergencyExit();
     for (let d = L; d < L + 7n; d++) await f.vault.connect(attacker).releaseEmptyRewards(weth, d);
     await expect(f.vault.connect(attacker).recoverExcess(weth)).to.changeTokenBalance(f.weth, attacker, 70n * WAD);
-    // Defence for an honest operation: anyone can recycle each zero-power day as it closes, which keeps the
-    // budget scheduled and blocks acceptance (see docs/SECURITY.md, review 3).
-  });
-
-  it('anyone recycling each zero-power day as it closes keeps acceptance blocked', async function () {
-    const f = await fixture({ launchInDays: 60 });
-    const weth = await f.weth.getAddress(), attacker = f.stranger, L = f.launch / DAY;
-    await f.vault.connect(f.distributor).notifyRewardETH({ value: 70n * WAD });
-    await f.vault.setLocksPaused(true);
-    await mineAt(f.launch - DAY);
-    await f.vault.proposeTreasury(attacker.address);
-    for (let d = L; d < L + 7n; d++) await txAt((d + 1n) * DAY + 1n, () => f.vault.connect(f.bob).recycleEmptyRewards(weth, d));
-    await expect(f.vault.connect(attacker).acceptTreasury()).to.be.revertedWithCustomError(f.vault, 'UnearnedRewardsScheduled');
   });
 });
 
-describe('PulpVeVault: review 3 I-1: the treasury is never WETH or an expired reward token', function () {
-  it('proposeTreasury refuses WETH even once it is no longer a reward token, and every expired token', async function () {
+describe('PulpVeVault: review 3 I-1: the treasury is never WETH or a token with books', function () {
+  it('proposeTreasury refuses WETH even once it is no longer a reward token, and every retired token', async function () {
     const f = await fixture();
     const weth = await f.weth.getAddress();
     const reward = await addReward(f, 'R');
@@ -100,11 +87,9 @@ describe('PulpVeVault: review 3 I-1: the treasury is never WETH or an expired re
     await f.vault.removeRewardToken(weth); // never funded: dropped entirely, no books left
     expect([await f.vault.isRewardToken(weth), await f.vault.isRetiredRewardToken(weth)]).to.deep.equal([false, false]);
     await expect(f.vault.proposeTreasury(weth)).to.be.revertedWithCustomError(f.vault, 'InvalidTreasury');
-    await f.vault.connect(f.alice).claim(token, 64); // Bob never claims: retired, then expired
-    const retired = await stampOf(f.vault.removeRewardToken(token));
-    await mineAt(retired + 120n * DAY);
-    await f.vault.expireRewardToken(token);
-    expect(await f.vault.isExpiredRewardToken(token)).to.equal(true);
+    await f.vault.connect(f.alice).claim(token, 64); // Bob never claims: retired
+    await f.vault.removeRewardToken(token);
+    expect(await f.vault.isRetiredRewardToken(token)).to.equal(true);
     await expect(f.vault.proposeTreasury(token)).to.be.revertedWithCustomError(f.vault, 'InvalidTreasury');
     // A pending proposal is re-checked on acceptance.
     const later = await (await ethers.getContractFactory('MockERC20')).deploy('L', 'L', 18);
